@@ -1,23 +1,24 @@
 # Inventory Tracking App — Design Document
 
 **Date:** 2026-04-03
-**Status:** Draft (Revised after Codex review rounds 1-2)
+**Status:** Implemented
 
 ## Problem
 
-A team of 5 needs to track physical product inventory (receiving and consuming stock) with full audit trails, low stock alerts, and expiration tracking. The solution should use Microsoft 365 infrastructure the team already has.
+A team of 5 needs to track physical biolab inventory (receiving and consuming stock) with full audit trails, low stock alerts, lot/batch-level expiration tracking, and FEFO consumption. The solution should use Microsoft 365 infrastructure the team already has.
 
 ## Architecture
 
 ### Stack
 
-- **Frontend:** React SPA (TypeScript)
+- **Frontend:** React 19 SPA (TypeScript)
 - **Backend:** None — browser talks directly to Microsoft Graph API
 - **Storage:** JSON file in a SharePoint document library (not personal OneDrive)
-- **Auth:** Microsoft SSO via MSAL
-- **Hosting:** Azure Static Web Apps (free tier)
+- **Auth:** Microsoft SSO via MSAL (optional in dev — app runs with mock data when not configured)
+- **Hosting:** GitHub Pages (primary) or Azure Static Web Apps
 - **Build tool:** Vite
-- **Testing:** Vitest + React Testing Library
+- **Testing:** Vitest (54 tests)
+- **Validation:** Zod (runtime schema validation)
 
 ### Why SharePoint Instead of OneDrive
 
@@ -33,6 +34,8 @@ OneDrive shared folders are exposed as `remoteItem`s via Microsoft Graph, requir
 2. MSAL acquires a token with SharePoint permissions
 3. The app reads/writes JSON files in a SharePoint document library via Microsoft Graph API
 4. All 5 team members have access to the same SharePoint site, so everyone sees the same data
+
+**Dev mode:** When `VITE_MSAL_CLIENT_ID` is not set, the app skips authentication entirely and loads mock biolab data. This allows frontend development without Azure AD setup.
 
 ### Data Files in SharePoint
 
@@ -58,17 +61,20 @@ OneDrive shared folders are exposed as `remoteItem`s via Microsoft Graph, requir
       "type": "stock-in | stock-out | item-create | item-update | item-delete",
       "itemId": "uuid",
       "data": {
-        "sku": "WDG-001",
-        "name": "Blue Widget",
+        "sku": "PCR-001",
+        "name": "PCR Tubes 0.2mL (1000pk)",
         "quantity": 50,
-        "location": "Warehouse A, Shelf 3",
-        "category": "Widgets",
-        "supplier": "Acme Corp",
-        "unitCost": 4.99,
-        "reorderPoint": 50,
+        "location": "Room 101, Bench 2",
+        "category": "Consumables",
+        "supplier": "Thermo Fisher",
+        "vendor": "Fisher Scientific",
+        "referenceNumber": "PO-2026-0001",
+        "unitCost": 45.00,
+        "reorderPoint": 10,
+        "lotNumber": "TF-PCR2401A",
         "expirationDate": "2027-03-15",
-        "imageFilename": "wdg-001.jpg",
-        "note": "Received from Acme, PO #1234"
+        "imageFilename": "pcr-001.jpg",
+        "note": "Received from Thermo Fisher, PO #1234"
       },
       "performedBy": "user@company.com",
       "timestamp": "2026-04-03T10:30:00Z"
@@ -82,78 +88,128 @@ OneDrive shared folders are exposed as `remoteItem`s via Microsoft Graph, requir
 On every load, the app replays all transactions to produce the current item list:
 
 ```typescript
+interface Batch {
+  lotNumber: string;
+  expirationDate: string;
+  quantity: number;
+  receivedAt: string;
+}
+
 interface InventoryItem {
   id: string;
   sku: string;
   name: string;
-  quantity: number;
+  quantity: number;        // total across all batches
   location: string;
   category: string;
   supplier: string;
-  unitCost: number;
+  vendor: string;
+  referenceNumber: string;
+  unitCost?: number;       // optional — not all items have cost info
   reorderPoint: number;
-  expirationDate: string;
-  imageFilename: string;
+  imageFilename?: string;
   createdBy: string;
   updatedAt: string;
+  batches: Batch[];        // lot-level inventory with per-batch expiration
+  earliestExpiration: string; // computed from batches for quick display
 }
 ```
 
-For a team of 5 with moderate inventory, replaying the full log on each load is fast enough. If the log grows large in the future, a persisted snapshot with freshness verification can be added later.
+### Lot / Batch Tracking
+
+Each stock-in records a **lot number** and **expiration date**, creating a new batch. Items can have multiple batches with different lot numbers and expiration dates. When stock is consumed (stock-out), the app uses **FEFO** (First Expired, First Out) — the earliest-expiring batch is consumed first. Batches without expiration dates sort last.
 
 ### Transaction Types
 
 | Type | Data Fields | Effect |
 |------|-------------|--------|
-| `item-create` | All item fields | Adds new item |
-| `item-update` | Changed fields only + itemId | Updates item fields |
-| `item-delete` | itemId only | Removes item |
-| `stock-in` | quantity, note | Increases item quantity |
-| `stock-out` | quantity, note | Decreases item quantity (rejects if would go negative) |
+| `item-create` | All item fields + optional lotNumber/expirationDate | Adds new item, optionally creates initial batch |
+| `item-update` | Changed metadata fields only (strict whitelist) | Updates item fields (not quantity) |
+| `item-delete` | itemId only + optional note | Removes item |
+| `stock-in` | quantity, lotNumber, expirationDate, note | Creates new batch, increases total quantity |
+| `stock-out` | quantity, note | Consumes from earliest-expiring batch (FEFO) |
 
 ### Key Decisions
 
 - **Append-only log is the single source of truth** — no separate inventory file, no persisted snapshot
 - **State derived in memory on every load** — always fresh, no stale cache risk
-- **Idempotency via transaction UUID** — before appending, check if the ID already exists in the log. Prevents duplicate submissions on retry
+- **Batch-level expiration** — expiration is per stock-in, not per item. Different orders of the same SKU can have different lot numbers and expiration dates
+- **FEFO consumption** — stock-out automatically takes from the earliest-expiring batch first
+- **Idempotency via transaction UUID** — before appending, check if the ID already exists in the log
 - **All mutations audited** — no way to change quantity without creating a transaction record
 - **`performedBy` comes from MSAL token claims** — not user-editable
-- **Business rule validation on write** — stock-out rejects if current quantity (derived from fresh transaction log) would go negative
+- **Business rule validation on write** — stock-out rejects if current quantity would go negative
+
+## Permissions
+
+### Role-Based Access via Azure AD App Roles
+
+- **All authenticated users** can: add/edit/delete items, record stock in/out, export data
+- **Admins only** can: bulk import via CSV
+
+Admin access is controlled through **Azure AD App Roles**:
+1. Create an "Admin" app role in Azure AD app registration
+2. Assign specific users or security groups to the role
+3. The app reads the `roles` claim from the user's ID token
+
+In local dev, admins are defined in `src/auth/permissions.ts` as a fallback list.
 
 ## UI Screens
 
 ### 1. Dashboard
 
-- Total item count and total inventory value (qty x unit cost)
-- Low stock alerts: items at or below reorder point
-- Expiring soon: items expiring within 30 days
-- Recent activity feed (last 10 transactions)
+- **Summary cards:** Total Products (with unit count), Low Stock Alerts, Expiring Soon — no inventory value card (unit cost data is incomplete)
+- **Low stock alerts:** clickable table of items at or below reorder point, links to item detail
+- **Expiring soon:** clickable table showing individual **batches** (not rolled-up SKUs) expiring within 30 days, with lot number, batch quantity, days remaining, and urgency bar
+- **Recent activity:** scrollable feed of last 10 transactions with type icons, item names, quantities, user, and relative timestamps
 
 ### 2. Inventory List
 
 - Searchable, sortable, filterable table of all items
-- Filters: category, location, supplier, stock status (normal / low / out)
-- Click row to open item detail (full edit of item metadata, image, transaction history for that item)
-- **No inline quantity edit** — all quantity changes go through Stock In/Out to maintain audit trail
+- Columns: SKU, Name, Qty, Location, Category, Supplier, Vendor, Ref#, Unit Cost, Status
+- Search bar filters across SKU, name, supplier
+- Filter dropdowns: category, stock status (normal / low / out)
+- Click row to open item detail
+- "+ New Item" button to create items inline
+- Empty state when no items exist
 
-### 3. Stock In / Stock Out
+### 3. Item Detail
 
-- Single form with toggle for direction (receiving vs. using)
-- Search/select item by SKU or name
-- Enter quantity and optional note
-- Validates quantity > 0 and (for stock-out) current stock >= requested quantity
-- Submit appends to `transactions.json` and re-derives state in memory
+- **Left panel:** Item metadata displayed as a details table with inline editing (click any value to edit). All fields editable except SKU and quantity. Unit cost uses text input with decimal mode (no spinner arrows).
+- **Right panel top:** Lot/Batch Inventory table showing all active batches with lot number, quantity, expiration date, and received date
+- **Right panel bottom:** Activity Log showing all transactions for this specific item
+- Edit and Delete buttons available to all authenticated users
+- Each edit creates an `item-update` transaction for audit trail
 
-### 4. Export
+### 4. Stock In / Stock Out
 
-- Export current inventory to .xlsx or .csv
-- Export transaction log to .xlsx or .csv
-- Date range filter for transaction export
+- Toggle for direction: Receiving (stock-in) / Using (stock-out)
+- Searchable item dropdown showing current quantity
+- Quantity input with validation
+- **Stock-in only:** Lot Number and Expiration Date fields (creates a new batch)
+- **Stock-out:** FEFO consumption (no lot selection needed — auto-consumes earliest expiring)
+- Validates: quantity > 0, sufficient stock for stock-out
+
+### 5. Import (Admin Only)
+
+- Non-admin users see a lock screen explaining admin access is required
+- CSV file upload with drag-and-drop
+- **Append mode (default):** New SKUs are created, existing SKUs shown as "Skip"
+- **Overwrite mode (optional):** Checkbox to enable updating existing items, with red warning banner
+- Preview table showing each row's status: New, Skip, or Update
+- Sample CSV file available at `public/sample-import.csv`
+
+### 6. Export
+
+- Export current inventory as CSV
+- Export transaction log as CSV
+- Download blank CSV template for import
+- Format toggle (CSV/XLSX, with XLSX noted as requiring additional library)
 
 ### Navigation
 
-- Top bar with: Dashboard, Inventory, Stock In/Out, Export
-- Logged-in user name + sign out button
+- Top bar with: Dashboard, Inventory, Stock In/Out, Import, Export
+- Logged-in user email + avatar initials + sign out button
 
 ## Concurrency Handling
 
@@ -180,6 +236,7 @@ Since `transactions.json` is the only writable file:
 - No offline mode: if SharePoint is down, the app shows an error state
 - All API errors surfaced as user-friendly toast notifications
 - **Schema validation on JSON read** — if the file is corrupted or has unexpected shape, show a clear error rather than crashing
+- **Error boundary** at app root catches unhandled React errors
 
 ## Alerts
 
@@ -190,14 +247,14 @@ Since `transactions.json` is the only writable file:
 
 ### Permissions
 
-- **`Sites.Selected`** (recommended) — grants access only to the specific SharePoint site used by the app. Requires an admin to explicitly grant the app access to the site via Microsoft Graph or PowerShell. This is the minimum-scope option.
-- **`Sites.ReadWrite.All`** (fallback) — grants delegated access to all site collections the signed-in user can access. This is tenant-wide, not site-scoped. Use only if `Sites.Selected` setup is impractical.
+- **`Sites.Selected`** (recommended) — grants access only to the specific SharePoint site used by the app
+- **`Sites.ReadWrite.All`** (fallback) — grants delegated access to all site collections the signed-in user can access
 - **`User.Read`** for logged-in user info
 
 ### Token Handling
 
 - MSAL handles token storage and refresh
-- Token cache stored in `sessionStorage` — persists across page reloads within the tab, cleared on tab close. Avoids re-login on every refresh (which `memoryStorage` would cause) while limiting exposure compared to `localStorage`.
+- Token cache stored in `sessionStorage` — persists across page reloads within the tab, cleared on tab close
 - Content Security Policy headers configured on Azure Static Web Apps
 
 ### Audit Integrity Note
@@ -208,106 +265,84 @@ This is a browser-only app. Users with SharePoint edit access could theoreticall
 
 | Package | Purpose |
 |---------|---------|
-| `react`, `react-dom` | UI framework |
+| `react`, `react-dom` | UI framework (React 19) |
 | `@azure/msal-browser`, `@azure/msal-react` | Microsoft SSO |
-| `@microsoft/microsoft-graph-client` | SharePoint file operations |
-| `@tanstack/react-table` | Sortable/filterable inventory table |
 | `react-router-dom` | Page navigation |
-| `xlsx` | Export to Excel/CSV |
 | `uuid` | Generate transaction and item IDs |
 | `zod` | Runtime schema validation for JSON files |
 | `vite` | Build tool |
-| `vitest` | Unit/integration testing |
-| `@testing-library/react` | Component testing |
+| `vitest` | Unit testing (54 tests) |
+| `@testing-library/react`, `@testing-library/jest-dom` | Component/DOM testing utilities |
+
+**Not used (removed from original plan):**
+- `@microsoft/microsoft-graph-client` — thin `fetch` wrapper used instead for direct control over ETag headers
+- `@tanstack/react-table` — plain HTML tables used for simplicity
+- `xlsx` — CSV export implemented natively, XLSX deferred
 
 ## Project Structure
 
 ```
 src/
-  auth/           — MSAL config, auth provider wrapper
-  api/            — Graph API helpers (read/write JSON, upload images)
-  components/     — reusable UI (table, forms, alerts, toasts)
+  auth/           — MSAL config, AuthGate (dev/prod mode switching), AuthProvider, permissions
+  api/            — Graph API helpers (graphClient, fileOperations, transactionService, bootstrap)
+  components/     — reusable UI (LoginPage, ErrorBoundary)
+  context/        — InventoryContext (shared mutable state with transaction audit trail)
+  mock/           — biolab sample data and helper functions
+  models/         — TypeScript types + Zod schemas (inventory, transaction, schemas)
   pages/
     Dashboard.tsx
     InventoryList.tsx
+    NewItem.tsx
     ItemDetail.tsx
     StockForm.tsx
+    Import.tsx
     Export.tsx
-  models/         — TypeScript types + Zod schemas for Transaction, Item
-  utils/          — conflict resolution, state derivation, date helpers
-  App.tsx         — router + layout
+  utils/          — deriveState (FEFO batch engine), validation, date helpers
+  test/           — test setup
+  App.tsx         — router + layout + auth
   main.tsx        — entry point
+public/
+  sample-import.csv — sample CSV for import testing
+docs/
+  plans/          — design doc + implementation plan
+  deployment-guide.md — step-by-step Azure deployment
+.github/
+  workflows/
+    deploy.yml    — GitHub Pages deployment via GitHub Actions
 ```
 
-## Implementation Phases
+## Deployment
 
-### Phase 1: Bootstrap
-- `npm create vite@latest` with React + TypeScript template
-- Install dependencies
-- Set up Vitest configuration
-- Create project structure
+### Option A: GitHub Pages (Current)
 
-### Phase 2: Auth & Environment Config
-- Azure AD app registration (one-time manual step)
-- MSAL configuration with environment variables
-- Auth provider wrapper component
-- Login/logout flow
+- GitHub Actions workflow builds on push to `master` and deploys to GitHub Pages
+- Vite `base` set to `/inventory-tracking/` and BrowserRouter uses matching `basename`
+- Live at `https://dxinchen.github.io/inventory-tracking/`
+- In dev mode (no MSAL configured), runs with mock data — no auth required
 
-### Phase 3: Storage Abstraction
-- Graph API client wrapper (authenticated requests)
-- JSON file read/write helpers with eTag tracking
-- Zod schemas for Transaction validation
-- Image upload/download helpers
+### Option B: Azure Static Web Apps
 
-### Phase 4: Mutation Engine
-- Transaction append with idempotency check
-- State derivation from transaction log (replay function)
-- Conflict retry with business rule revalidation
-- Negative-inventory guard on stock-out
+1. Create a Static Web App resource in Azure Portal (free tier)
+2. Connect to git repository, set app location `/` and output `dist`
+3. Set environment variables for MSAL and SharePoint
+4. Add production URL as redirect URI in Azure AD app registration
+5. SPA fallback routing configured via `staticwebapp.config.json`
 
-### Phase 5: Tests
-- Unit tests for state derivation logic
-- Unit tests for conflict retry and idempotency
-- Unit tests for business rule validation (negative stock, etc.)
-- Integration tests for Graph API wrapper (mocked)
+## Azure Setup (for Production with SharePoint)
 
-### Phase 6: UI
-- App shell with router and navigation
-- Dashboard page
-- Inventory list with TanStack Table
-- Item detail view
-- Stock In/Out form
-- Export page
-
-## Azure Setup
-
-### 1. Azure AD App Registration (one-time)
+### 1. Azure AD App Registration
 
 1. Go to Azure Portal > Entra ID > App registrations > New registration
-2. Name: "Inventory Tracking App"
-3. Supported account types: "Accounts in this organizational directory only"
-4. Redirect URI: `http://localhost:5173` (dev) and your production URL
-5. Under API permissions, add Microsoft Graph:
-   - **Recommended:** `Sites.Selected` (delegated permission) — then grant site-level access via PowerShell or Graph API
-   - **Fallback:** `Sites.ReadWrite.All` (delegated) — tenant-wide access to all sites the user can reach
-   - `User.Read` (delegated) — get logged-in user info
-6. Grant admin consent for the permissions
-7. Copy the Application (client) ID and Tenant ID — these go in the app's MSAL config
+2. Name: "Inventory Tracking App", Single tenant
+3. Redirect URI: SPA, `http://localhost:5173` + production URL
+4. API permissions: `Sites.ReadWrite.All` (delegated), `User.Read` (delegated)
+5. Grant admin consent
+6. App roles: Create "Admin" role (Value: `Admin`, Users/Groups)
+7. Assign admin users via Enterprise applications > Users and groups
 
 ### 2. SharePoint Site & Document Library
 
-1. Create a SharePoint site (or use an existing team site)
-2. The default "Documents" library works, or create a dedicated library
-3. Create the `/InventoryApp/` folder structure
+1. Create a SharePoint team site
+2. Create `/InventoryApp/` folder in the document library
+3. Get Site ID and Drive ID via Graph Explorer
 4. All team members get access via SharePoint site membership
-5. Store the site ID and drive ID in the app's environment config
-6. If using `Sites.Selected`, grant the app access to this specific site
-
-### 3. Azure Static Web Apps Deployment
-
-1. Create a Static Web App resource in Azure Portal (free tier)
-2. Connect it to your git repository
-3. Set app location to `/` and output location to `dist`
-4. Azure auto-deploys on every push
-5. No custom domain name required — Azure provides a URL like `https://<auto-generated-name>.azurestaticapps.net`
-6. Add the production URL as a redirect URI in the app registration
