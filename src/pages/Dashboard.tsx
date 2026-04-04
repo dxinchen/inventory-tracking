@@ -313,11 +313,11 @@ export default function Dashboard() {
 
       <div className="dashboard-grid">
         <LowStockTable items={items} />
-        <ActivityFeed />
+        <ExpiringTable items={items} />
       </div>
 
       <div className="dashboard-grid" style={{ gridTemplateColumns: '1fr' }}>
-        <ExpiringTable items={items} />
+        <ActivityFeed />
       </div>
     </main>
   );

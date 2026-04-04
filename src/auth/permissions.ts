@@ -19,8 +19,7 @@ const ADMIN_ROLE = 'Admin';
  * In production, roles come from the token — this list is ignored.
  */
 const DEV_ADMINS: string[] = [
-  'd.chen@biolabs.com',
-  'j.martinez@biolabs.com',
+  'xdu@mabwell-therapeutics.com',
 ];
 
 export function isAdmin(email?: string): boolean {

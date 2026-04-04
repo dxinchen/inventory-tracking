@@ -1,11 +1,7 @@
 import { BrowserRouter, Routes, Route, NavLink, Navigate } from 'react-router-dom';
 import { InventoryProvider } from './context/InventoryContext';
 import ErrorBoundary from './components/ErrorBoundary';
-// import LoginPage from './components/LoginPage';
-// TODO: When MSAL is configured, import useAuth and gate the app:
-//   import { useAuth } from './auth/useAuth';
-//   const { isAuthenticated, login } = useAuth();
-//   if (!isAuthenticated) return <LoginPage onSignIn={login} />;
+import AuthGate from './auth/AuthGate';
 import Dashboard from './pages/Dashboard';
 import InventoryList from './pages/InventoryList';
 import NewItem from './pages/NewItem';
@@ -14,7 +10,14 @@ import StockForm from './pages/StockForm';
 import Export from './pages/Export';
 import Import from './pages/Import';
 
-function NavBar() {
+function NavBar({ userEmail, onLogout }: { userEmail: string; onLogout?: () => void }) {
+  const initials = userEmail
+    .split(/[@.]/)
+    .filter(Boolean)
+    .slice(0, 2)
+    .map(s => s[0].toUpperCase())
+    .join('');
+
   return (
     <nav className="nav-bar">
       <NavLink to="/" className="nav-brand">
@@ -51,10 +54,30 @@ function NavBar() {
       </ul>
 
       <div className="nav-user">
-        <span className="nav-user-name">d.chen@biolabs.com</span>
-        <div className="nav-user-avatar">DC</div>
+        <span className="nav-user-name">{userEmail}</span>
+        <div className="nav-user-avatar" onClick={onLogout} style={onLogout ? { cursor: 'pointer' } : undefined} title={onLogout ? 'Sign out' : undefined}>
+          {initials}
+        </div>
       </div>
     </nav>
+  );
+}
+
+function AppShell({ userEmail, onLogout }: { userEmail: string; onLogout?: () => void }) {
+  return (
+    <InventoryProvider userEmail={userEmail}>
+      <NavBar userEmail={userEmail} onLogout={onLogout} />
+      <Routes>
+        <Route path="/" element={<Dashboard />} />
+        <Route path="/inventory" element={<InventoryList />} />
+        <Route path="/inventory/new" element={<NewItem />} />
+        <Route path="/inventory/:id" element={<ItemDetail />} />
+        <Route path="/stock" element={<StockForm />} />
+        <Route path="/import" element={<Import />} />
+        <Route path="/export" element={<Export />} />
+        <Route path="*" element={<Navigate to="/" replace />} />
+      </Routes>
+    </InventoryProvider>
   );
 }
 
@@ -62,19 +85,11 @@ export default function App() {
   return (
     <BrowserRouter>
       <ErrorBoundary>
-        <InventoryProvider>
-          <NavBar />
-          <Routes>
-            <Route path="/" element={<Dashboard />} />
-            <Route path="/inventory" element={<InventoryList />} />
-            <Route path="/inventory/new" element={<NewItem />} />
-            <Route path="/inventory/:id" element={<ItemDetail />} />
-            <Route path="/stock" element={<StockForm />} />
-            <Route path="/import" element={<Import />} />
-            <Route path="/export" element={<Export />} />
-            <Route path="*" element={<Navigate to="/" replace />} />
-          </Routes>
-        </InventoryProvider>
+        <AuthGate>
+          {({ userEmail, onLogout }) => (
+            <AppShell userEmail={userEmail} onLogout={onLogout} />
+          )}
+        </AuthGate>
       </ErrorBoundary>
     </BrowserRouter>
   );

@@ -6,6 +6,9 @@ import type { Transaction, ItemCreateData, ItemUpdateData, StockData } from '../
 import { deriveInventory } from '../utils/deriveState';
 import { isAdmin } from '../auth/permissions';
 
+/** Set by InventoryProvider from the authenticated user's email */
+let currentUserEmail = 'd.chen@biolabs.com';
+
 interface InventoryContextValue {
   items: InventoryItem[];
   transactions: Transaction[];
@@ -35,13 +38,14 @@ function buildTransaction(
     type,
     itemId,
     data,
-    performedBy: 'd.chen@biolabs.com',
+    performedBy: currentUserEmail,
     timestamp: new Date().toISOString(),
   };
 }
 
-export function InventoryProvider({ children }: { children: ReactNode }) {
-  const adminFlag = useMemo(() => isAdmin('d.chen@biolabs.com'), []);
+export function InventoryProvider({ children, userEmail }: { children: ReactNode; userEmail?: string }) {
+  if (userEmail) currentUserEmail = userEmail;
+  const adminFlag = useMemo(() => isAdmin(currentUserEmail), []);
   const [transactions, setTransactions] = useState<Transaction[]>(mockTransactions as Transaction[]);
   // Initialize items from mock data directly (already pre-derived with batches)
   const [items, setItems] = useState<InventoryItem[]>(mockItems as InventoryItem[]);
