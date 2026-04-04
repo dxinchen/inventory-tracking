@@ -1,8 +1,12 @@
 import { BrowserRouter, Routes, Route, NavLink, Navigate } from 'react-router-dom';
+import { InventoryProvider } from './context/InventoryContext';
 import Dashboard from './pages/Dashboard';
 import InventoryList from './pages/InventoryList';
+import NewItem from './pages/NewItem';
+import ItemDetail from './pages/ItemDetail';
 import StockForm from './pages/StockForm';
 import Export from './pages/Export';
+import Import from './pages/Import';
 
 function NavBar() {
   return (
@@ -29,6 +33,11 @@ function NavBar() {
           </NavLink>
         </li>
         <li>
+          <NavLink to="/import" className={({ isActive }) => `nav-link${isActive ? ' active' : ''}`}>
+            Import
+          </NavLink>
+        </li>
+        <li>
           <NavLink to="/export" className={({ isActive }) => `nav-link${isActive ? ' active' : ''}`}>
             Export
           </NavLink>
@@ -36,7 +45,7 @@ function NavBar() {
       </ul>
 
       <div className="nav-user">
-        <span className="nav-user-name">d.chen@company.com</span>
+        <span className="nav-user-name">d.chen@biolabs.com</span>
         <div className="nav-user-avatar">DC</div>
       </div>
     </nav>
@@ -46,14 +55,19 @@ function NavBar() {
 export default function App() {
   return (
     <BrowserRouter>
-      <NavBar />
-      <Routes>
-        <Route path="/" element={<Dashboard />} />
-        <Route path="/inventory" element={<InventoryList />} />
-        <Route path="/stock" element={<StockForm />} />
-        <Route path="/export" element={<Export />} />
-        <Route path="*" element={<Navigate to="/" replace />} />
-      </Routes>
+      <InventoryProvider>
+        <NavBar />
+        <Routes>
+          <Route path="/" element={<Dashboard />} />
+          <Route path="/inventory" element={<InventoryList />} />
+          <Route path="/inventory/new" element={<NewItem />} />
+          <Route path="/inventory/:id" element={<ItemDetail />} />
+          <Route path="/stock" element={<StockForm />} />
+          <Route path="/import" element={<Import />} />
+          <Route path="/export" element={<Export />} />
+          <Route path="*" element={<Navigate to="/" replace />} />
+        </Routes>
+      </InventoryProvider>
     </BrowserRouter>
   );
 }

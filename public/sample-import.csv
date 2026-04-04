@@ -1,0 +1,11 @@
+SKU,Name,Quantity,Location,Category,Supplier,Vendor,Reference Number,Unit Cost,Reorder Point,Expiration Date
+RNA-EXT,RNeasy Mini Kit (50),12,Room 103 Shelf A1,Assay Kits,Qiagen,Qiagen N.V.,PO-2026-0050,249.00,5,2027-02-28
+BUF-PBS,PBS 10X 1L,24,Cold Room 4C Shelf 1,Reagents,Corning,Corning Life Sciences,PO-2026-0051,12.50,8,2027-08-15
+PLT-96W,96-Well Flat Bottom Plates (50pk),30,Room 102 Shelf C4,Consumables,Corning,Corning Life Sciences,PO-2026-0052,185.00,10,
+SER-PEN,Penicillin-Streptomycin 100mL,6,Cold Room 4C Shelf 3,Cell Culture,Gibco,Thermo Fisher Scientific,PO-2026-0053,22.80,4,2026-09-30
+DYE-SYB,SYBR Green Master Mix 5mL,4,Freezer -20C Rack 4,Reagents,Applied Biosystems,Thermo Fisher Scientific,PO-2026-0054,395.00,2,2026-12-01
+TIP-1000,Pipette Tips 1000uL (960pk),48,Room 102 Shelf B3,Consumables,Rainin,Mettler Toledo / Rainin,PO-2026-0055,62.00,15,
+GEL-AGAROSE,Agarose LE 500g,8,Room 101 Cabinet 3,Reagents,Benchmark Scientific,Benchmark Scientific,PO-2026-0056,89.00,3,
+CRY-VIAL,Cryogenic Vials 2mL (500pk),15,Room 102 Shelf D1,Consumables,Nalgene,Thermo Fisher Scientific,PO-2026-0057,142.00,5,
+AB-HER2,Anti-HER2 Rabbit mAb 100uL,2,Freezer -20C Rack 1,Antibodies,Cell Signaling,Cell Signaling Technology,PO-2026-0058,425.00,1,2026-11-15
+TRPN-01,Trypsin-EDTA 0.25% 100mL,10,Cold Room 4C Shelf 2,Cell Culture,Gibco,Thermo Fisher Scientific,PO-2026-0059,28.50,4,2026-08-20
