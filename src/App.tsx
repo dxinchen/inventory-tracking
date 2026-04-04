@@ -1,5 +1,11 @@
 import { BrowserRouter, Routes, Route, NavLink, Navigate } from 'react-router-dom';
 import { InventoryProvider } from './context/InventoryContext';
+import ErrorBoundary from './components/ErrorBoundary';
+// import LoginPage from './components/LoginPage';
+// TODO: When MSAL is configured, import useAuth and gate the app:
+//   import { useAuth } from './auth/useAuth';
+//   const { isAuthenticated, login } = useAuth();
+//   if (!isAuthenticated) return <LoginPage onSignIn={login} />;
 import Dashboard from './pages/Dashboard';
 import InventoryList from './pages/InventoryList';
 import NewItem from './pages/NewItem';
@@ -55,19 +61,21 @@ function NavBar() {
 export default function App() {
   return (
     <BrowserRouter>
-      <InventoryProvider>
-        <NavBar />
-        <Routes>
-          <Route path="/" element={<Dashboard />} />
-          <Route path="/inventory" element={<InventoryList />} />
-          <Route path="/inventory/new" element={<NewItem />} />
-          <Route path="/inventory/:id" element={<ItemDetail />} />
-          <Route path="/stock" element={<StockForm />} />
-          <Route path="/import" element={<Import />} />
-          <Route path="/export" element={<Export />} />
-          <Route path="*" element={<Navigate to="/" replace />} />
-        </Routes>
-      </InventoryProvider>
+      <ErrorBoundary>
+        <InventoryProvider>
+          <NavBar />
+          <Routes>
+            <Route path="/" element={<Dashboard />} />
+            <Route path="/inventory" element={<InventoryList />} />
+            <Route path="/inventory/new" element={<NewItem />} />
+            <Route path="/inventory/:id" element={<ItemDetail />} />
+            <Route path="/stock" element={<StockForm />} />
+            <Route path="/import" element={<Import />} />
+            <Route path="/export" element={<Export />} />
+            <Route path="*" element={<Navigate to="/" replace />} />
+          </Routes>
+        </InventoryProvider>
+      </ErrorBoundary>
     </BrowserRouter>
   );
 }

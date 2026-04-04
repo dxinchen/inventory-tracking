@@ -174,25 +174,31 @@ function ActivityFeed() {
         <span className="panel__count">{recent.length} entries</span>
       </div>
       <div className="panel__body">
-        <ul className="activity-list">
-          {recent.map(tx => {
-            const cfg = typeConfig[tx.type] ?? typeConfig['item-create'];
-            return (
-              <li key={tx.id} className="activity-item">
-                <div className={`activity-icon activity-icon--${cfg.iconClass}`}>
-                  {cfg.icon}
-                </div>
-                <div className="activity-content">
-                  <div className="activity-text">{renderText(tx)}</div>
-                  <div className="activity-meta">
-                    <span>{getFirstName(tx.performedBy)}</span>
-                    <span>{timeAgo(tx.timestamp)}</span>
+        {recent.length === 0 ? (
+          <div className="empty-state empty-state--inline">
+            <p className="empty-state__text">No activity yet</p>
+          </div>
+        ) : (
+          <ul className="activity-list">
+            {recent.map(tx => {
+              const cfg = typeConfig[tx.type] ?? typeConfig['item-create'];
+              return (
+                <li key={tx.id} className="activity-item">
+                  <div className={`activity-icon activity-icon--${cfg.iconClass}`}>
+                    {cfg.icon}
                   </div>
-                </div>
-              </li>
-            );
-          })}
-        </ul>
+                  <div className="activity-content">
+                    <div className="activity-text">{renderText(tx)}</div>
+                    <div className="activity-meta">
+                      <span>{getFirstName(tx.performedBy)}</span>
+                      <span>{timeAgo(tx.timestamp)}</span>
+                    </div>
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
+        )}
       </div>
     </div>
   );

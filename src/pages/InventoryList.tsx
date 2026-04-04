@@ -75,6 +75,25 @@ export default function InventoryList() {
     );
   }
 
+  if (items.length === 0) {
+    return (
+      <main className="page">
+        <div className="page-header">
+          <h1 className="page-title">Inventory</h1>
+          <span className="page-subtitle">0 items</span>
+        </div>
+        <div className="empty-state">
+          <div className="empty-state__icon">&#x1F4E6;</div>
+          <p className="empty-state__title">No items yet</p>
+          <p className="empty-state__text">Start building your inventory by adding your first item.</p>
+          <button className="btn btn-primary" onClick={() => navigate('/inventory/new')}>
+            + Create your first item
+          </button>
+        </div>
+      </main>
+    );
+  }
+
   return (
     <main className="page">
       <div className="page-header">
