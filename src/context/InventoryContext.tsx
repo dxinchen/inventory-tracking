@@ -3,7 +3,6 @@ import { v4 as uuidv4 } from 'uuid';
 import { mockItems, mockTransactions } from '../mock/data';
 import type { InventoryItem, Batch } from '../models/inventory';
 import type { Transaction, ItemCreateData, ItemUpdateData, StockData } from '../models/transaction';
-import { deriveInventory } from '../utils/deriveState';
 import { isAdmin } from '../auth/permissions';
 
 /** Set by InventoryProvider from the authenticated user's email */

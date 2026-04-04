@@ -22,7 +22,7 @@ export default function Export() {
     const headers = ['SKU', 'Name', 'Quantity', 'Location', 'Category', 'Supplier', 'Vendor', 'Reference Number', 'Unit Cost', 'Reorder Point', 'Expiration Date'];
     const rows = mockItems.map(i => [
       i.sku, i.name, String(i.quantity), i.location, i.category,
-      i.supplier, i.vendor, i.referenceNumber, i.unitCost.toFixed(2), String(i.reorderPoint), i.expirationDate || 'N/A',
+      i.supplier, i.vendor, i.referenceNumber, i.unitCost != null ? i.unitCost.toFixed(2) : '', String(i.reorderPoint), i.earliestExpiration || 'N/A',
     ]);
     downloadCSV(`inventory_${new Date().toISOString().slice(0, 10)}.csv`, headers, rows);
     setToast('Inventory exported');

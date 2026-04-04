@@ -1,4 +1,4 @@
-import { type ReactNode, useEffect, useState, useCallback } from 'react';
+import { type ReactNode, useEffect, useState } from 'react';
 import LoginPage from '../components/LoginPage';
 
 const clientId = import.meta.env.VITE_MSAL_CLIENT_ID;
