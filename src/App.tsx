@@ -83,7 +83,7 @@ function AppShell({ userEmail, onLogout }: { userEmail: string; onLogout?: () =>
 
 export default function App() {
   return (
-    <BrowserRouter>
+    <BrowserRouter basename="/inventory-tracking">
       <ErrorBoundary>
         <AuthGate>
           {({ userEmail, onLogout }) => (
