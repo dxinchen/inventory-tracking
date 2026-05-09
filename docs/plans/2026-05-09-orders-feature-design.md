@@ -80,7 +80,7 @@ All timestamps and dates are **stored in UTC** across the system. UI rendering a
 
 - `Transaction.timestamp` — full ISO 8601 UTC, e.g. `2026-05-09T17:42:00Z`. Existing pattern from `transactionService.ts:60`.
 - `Order.orderDate`, `Order.expectedDeliveryDate`, `Order.actualReceiveDate`, `OrderLineItem.expirationDate` — calendar dates only (`YYYY-MM-DD`), no time component, no timezone marker. These represent business dates (when something was placed/expected/received/expires); they don't shift with the viewer's timezone.
-- The `daysFromToday(n)` mock helper returns `YYYY-MM-DD` (date-only string), computed against `new Date()` in the browser's locale, then truncated. Stable enough for mock data; not load-bearing for production correctness.
+- The `daysFromToday(n)` mock helper returns `YYYY-MM-DD` (date-only string), computed as `new Date(Date.now() + n*86400000).toISOString().slice(0, 10)` — UTC-based truncation, matching the Overdue cutoff exactly. Using "browser locale" would create drift between mock dates and the dashboard's UTC-based comparison.
 - Comparisons like "is `expectedDeliveryDate < today`?" (the Overdue Orders dashboard callout) are string-comparable because the format is ISO `YYYY-MM-DD`. `today` is computed once per dashboard render via `new Date().toISOString().slice(0, 10)`.
 - Past-expiration check on receive uses the same `YYYY-MM-DD` comparison against today.
 
@@ -226,13 +226,16 @@ Both `appendTransaction()` (existing, `src/api/transactionService.ts:36`) and th
 
 ```ts
 type WriteResult = {
-  transactions: Transaction[];
-  items:        InventoryItem[];
-  orders:       Order[];
+  transactions: unknown[];        // RAW array including any unknown stale-bundle entries; this is the value to persist for the next write-back
+  known:        Transaction[];    // safeParse-passing entries only, for in-memory iteration / debugging
+  items:        InventoryItem[];  // post-commit derived
+  orders:       Order[];          // post-commit derived
 };
 ```
 
-instead of returning just `InventoryItem[]`. This lets `InventoryContext` update all three from one call without a follow-up read. The change is contained: `appendTransaction()` is currently called only by test fixtures and the unused `useInventoryData` hook, so updating the signature is low-risk.
+instead of returning just `InventoryItem[]`. This lets `InventoryContext` update all four from one call without a follow-up read.
+
+**`transactions` MUST be `unknown[]`** (the raw round-trip array), not `Transaction[]`. The next write-back appends to this array, preserving stale-bundle-written entries verbatim. Returning `Transaction[]` here would silently drop unknown entries on the next commit — directly contradicting the load-bearing rule under "Append target is `data.transactions` (raw)" below. The change is contained: `appendTransaction()` is currently called only by test fixtures and the unused `useInventoryData` hook, so updating the signature is low-risk.
 
 ### `appendTransactions(inputs[])` — batch atomic write
 
@@ -313,12 +316,12 @@ A perf test exercises M=50, N=5,000, T=10,000 and asserts <100 ms total validati
 
 `item-create`, `item-update`, `stock-in`, `stock-out` cases are otherwise unchanged.
 
-**Idempotency rules** (precise):
+**Idempotency rules** (precise) — **all ID lookups happen against the raw `data.transactions` array, NOT `known`**, so collisions with unknown stale-bundle entries are still detected:
 
 - **Pre-input duplicate-id check.** If two inputs in the batch share an `id`, throw `DuplicateInputIdError` immediately (programmer error). Additional check for order events: if two `order-*` inputs share the same `itemId` (which is the order UUID for those types), throw `DuplicateOrderIdError` — catches the bug shape "`cancelAndRecreate` accidentally pointed both the cancel and the recreate at the predecessor's order id." (The `id` check above does NOT catch this because `tx.id` is unique per tx, but `itemId` would be reused.)
-- **Full-match no-op.** If ALL input IDs already exist in the persisted log AND the persisted transactions match the inputs (same `type`, `itemId`, `data`), return the current derived state without writing — this is the idempotent retry path. Relies on the frozen-identity rule above.
-- **Partial overlap.** If a STRICT SUBSET of input IDs exist in the log, throw `BatchPartiallyCommittedError`. Caller decides whether to surface as a conflict or retry with new IDs.
-- **Mismatched id reuse.** If an input ID exists in the log but with different `type`/`itemId`/`data`, throw `IdReuseError`.
+- **Full-match no-op.** If ALL input IDs already exist in `data.transactions` (raw) AND the corresponding entries in `known` (where they Zod-parsed successfully) match the inputs (same `type`, `itemId`, `data`), return the current derived state without writing — this is the idempotent retry path. An input ID that exists in raw but not in known (i.e., a `safeParse` failure on what should be one of OUR inputs) implies extreme schema drift or a programmer error and falls through to `IdReuseError` rather than spuriously matching.
+- **Partial overlap.** If a STRICT SUBSET of input IDs exist in `data.transactions` (raw), throw `BatchPartiallyCommittedError`. Caller decides whether to surface as a conflict or retry with new IDs.
+- **Mismatched id reuse.** If an input ID exists in `data.transactions` (raw) but the corresponding `known` entry has different `type`/`itemId`/`data` — OR the entry never made it into `known` (Zod-parse-failed) — throw `IdReuseError`.
 
 ETag conflicts (412) re-trigger the entire validate-and-stage loop with the freshly-read log AND the backoff sleep above.
 
@@ -379,7 +382,7 @@ Mirrors `src/api/imageOperations.ts`: sanitize, prefix uuid, PUT to SharePoint, 
 ### Flow B — Receive an order
 
 1. From `/orders/:id`, user clicks "Receive" on a `placed` PO.
-2. Receive form (sub-route or modal) shows each line with: ordered qty, editable **received qty** (defaults to ordered, may be 0), **lot #** (required iff received qty > 0), **expiration date** (required iff received qty > 0). The form header has a **received-on date** picker that defaults to today; users may backdate up to 30 days (covers "we received this last Friday but the packing slip just landed on my desk"). Future dates are rejected. The chosen date persists on the transaction as `OrderReceiveData.actualReceiveDate`.
+2. Receive form (sub-route or modal) **pre-populates one row per `order.lineItems[i]`** (rows cannot be added or removed; the cross-schema check requires the receive's line-id-set match the order's exactly), each with: ordered qty, editable **received qty** (defaults to ordered, may be 0), **lot #** (required iff received qty > 0), **expiration date** (required iff received qty > 0). The form header has a **received-on date** picker that defaults to today; users may backdate up to 30 days (covers "we received this last Friday but the packing slip just landed on my desk"). Future dates are rejected. The chosen date persists on the transaction as `OrderReceiveData.actualReceiveDate`.
 3. **Receive docs** section (optional): drag/drop area, kept in browser memory.
 4. Submit:
    - Upload staged receive-stage attachments.
@@ -401,7 +404,9 @@ Receive is single-event: one click closes the PO. No partial-receive-across-mult
 The naive approach — uploading on file drop, before the order is saved — leaks files when the user cancels or validation fails. Instead, files transition through three states: **staged → uploaded → committed**. Cleanup is required at every transition where a file is abandoned.
 
 1. **Staged (in memory).** When the user adds a file, keep the `File` object in component state. Show in the UI as a chip with name, size, ✕ remove. No SharePoint call yet. **De-duplication:** before adding a new staged file, check the existing staged + uploaded lists for an entry with the same `name` AND `size` (cheap heuristic, no hashing). If a match is found, prompt: *"This looks like the same file you already added. Replace, keep both, or skip?"* — default to "Skip". Avoids accidental double-uploads when users drag a file twice.
-2. **Upload phase (on Save click).** Generate `orderId` upfront so paths are stable. Sequentially upload all staged files via `uploadOrderAttachment(orderId, file, stage, abortSignal)`, calling `ensureOrderFolder(orderId)` once before the first upload. **Each in-flight upload registers in `pendingUploads: Set<{ filename, abortController }>`** so unmount/cancel can `abort()` the network call before it commits server-side. As each completes successfully, the entry moves from `pendingUploads` to `uploadedAttachments` in component state. On per-file upload failure: show inline error, leave already-uploaded files in the uploaded list, let the user retry/remove the failed file. The order transaction is NOT committed yet.
+2. **Upload phase (on Save click).** Generate `orderId` upfront so paths are stable. Sequentially upload all staged files via `uploadOrderAttachment(orderId, file, stage, abortSignal)`, calling `ensureOrderFolder(orderId)` once before the first upload. **Each in-flight upload registers in `pendingUploads: Set<{ filename, abortController }>`**; the form's top-level `AbortController` (the same signal threaded into `appendTransactions` for commit-phase abort) **fans out to each child controller via `signal.addEventListener('abort', () => child.abort())`**, so a Cancel click during the upload phase aborts ALL in-flight uploads, not just the next-to-start. As each upload completes successfully, the entry moves from `pendingUploads` to `uploadedAttachments` in component state. On per-file upload failure: show inline error, leave already-uploaded files in the uploaded list, let the user retry/remove the failed file. The order transaction is NOT committed yet.
+
+   **Signal plumbing.** `uploadOrderAttachment(orderId, file, stage, signal)` calls `graphFetch(url, { method: 'PUT', body: file, signal })`. `graphClient.ts:51-63` already accepts `RequestInit` (which includes `signal`), so no change is needed in `graphClient.ts` itself; the change is only that the new attachment service AND `transactionService.ts`'s `appendTransaction(s)` thread the signal through their `graphFetch` calls. `getToken()` cannot be aborted (MSAL has no public abort API), so the signal check happens AFTER `getToken()` returns and BEFORE the actual `fetch`, as documented under "Save-flow UX during retry."
 3. **Commit phase.** Once all files are in `uploadedAttachments`, call `appendTransactions(...)` with the order transaction(s) that reference those filenames.
 4. **Cleanup triggers** — any of these abandons the in-flight upload state and must DELETE the `uploadedAttachments` files (best-effort, fire-and-forget):
    - **User clicks Cancel** on the form.
@@ -443,7 +448,7 @@ The current `src/context/InventoryContext.tsx` is mock-backed in BOTH dev and Sh
 1. On provider mount, if MSAL is configured, call `initializeDataStore()` then `readTransactionLog()`.
 2. Set `transactions` from the loaded log; derive `items` via `deriveInventory(transactions)` and `orders` via `deriveOrders(transactions)`.
 3. Mock data is used only when MSAL is NOT configured (dev mode), gated by the same `msalConfigured` boolean used in `AuthGate`.
-4. **Service return contract.** `appendTransaction()` and `appendTransactions()` are changed to return `{ transactions: Transaction[]; items: InventoryItem[]; orders: Order[] }` instead of just `InventoryItem[]`. The context replaces all three from this return value. Existing call sites of `appendTransaction()` are updated (today there are none in production code paths — the function is exercised only by tests and the unwired `useInventoryData` hook, so the breaking change is contained).
+4. **Service return contract.** `appendTransaction()` and `appendTransactions()` are changed to return `WriteResult = { transactions: unknown[]; known: Transaction[]; items: InventoryItem[]; orders: Order[] }` instead of just `InventoryItem[]` — see "Service return type" above for why `transactions` is `unknown[]` and not `Transaction[]`. The context replaces all four from this return value. Existing call sites of `appendTransaction()` are updated (today there are none in production code paths — the function is exercised only by tests and the unwired `useInventoryData` hook, so the breaking change is contained).
 
 Existing synchronous item/stock context methods are kept for dev mode; in SharePoint mode they delegate to `appendTransaction()` (turning the call site into an async one — the affected pages are listed in the impl order so they can be migrated together).
 
@@ -461,10 +466,11 @@ findLatestLineItemForItem(itemId): OrderLineItem | null;
 
 **State shape — items/orders are stored, not memoized.** Naively, you might `useMemo(() => deriveInventory(transactions), [transactions])` in the provider. But after every successful `appendTransaction(s)`, the context replaces `transactions` with the new array (reference changes), `useMemo` invalidates, and `deriveInventory` runs over the FULL N-element log — defeating the whole point of `appendTransactions` returning the already-derived `WriteResult.items` / `.orders` from the Map-based incremental `applyTransaction`.
 
-The context instead stores `items` and `orders` directly:
+The context instead stores raw and derived state directly:
 
 ```ts
-const [transactions, setTransactions] = useState<...>([]);
+const [transactions, setTransactions] = useState<unknown[]>([]);     // raw array for write-back
+const [known,        setKnown]        = useState<Transaction[]>([]);  // typed view for debugging/iteration
 const [items,        setItems]        = useState<InventoryItem[]>([]);
 const [orders,       setOrders]       = useState<Order[]>([]);
 
@@ -473,21 +479,39 @@ useEffect(() => {
   if (!msalConfigured) return;
   initializeDataStore().then(() => readTransactionLog().then(({ data, known }) => {
     setTransactions(data.transactions);
+    setKnown(known);
     setItems(deriveInventory(known));
     setOrders(deriveOrders(known));
   }));
 }, []);
 
-// After every commit: use the WriteResult directly, no re-derivation.
-async function commit(inputs) {
-  const result = await appendTransactions(inputs, signal);
-  setTransactions(result.transactions);
-  setItems(result.items);
-  setOrders(result.orders);
+// commit() is PRIVATE to the context. Public methods (createOrder, receiveOrder,
+// cancelOrder, addItem, updateItem, deleteItem, stockIn, stockOut) each construct
+// their input array internally and call commit().
+async function commit(inputs: TransactionInput[], signal?: AbortSignal): Promise<WriteResult> {
+  try {
+    const result = await appendTransactions(inputs, signal);
+    setTransactions(result.transactions);  // RAW
+    setKnown(result.known);
+    setItems(result.items);
+    setOrders(result.orders);
+    return result;
+  } catch (err) {
+    // State unchanged on failure. Caller (form's submit handler) catches the error
+    // to surface a "Try again" toast / re-enable the Save button. Errors propagate.
+    throw err;
+  }
+}
+
+// Example public method:
+async function createOrder(input: OrderCreateInput, signal?: AbortSignal): Promise<Order> {
+  const inputs = buildCreateOrderBatch(input);  // [...itemCreates, orderCreate]
+  const result = await commit(inputs, signal);
+  return result.orders.find(o => o.poNumber === input.poNumber)!;
 }
 ```
 
-Initial mount pays the O(N) replay once; subsequent commits are O(1) at the context layer (the work is already done by `appendTransactions`'s incremental loop). Memoization at consumer level (e.g. filtered lists) is per-page and unaffected by this rule.
+`commit` is internal — the public surface remains the named methods listed under "Context surface gains" above. Each public method constructs its inputs (including pre-rolled UUIDs/SKUs per the frozen-identity rule) and calls `commit`. Initial mount pays the O(N) replay once; subsequent commits are O(1) at the context layer (`applyTransaction`'s incremental work is already done inside `appendTransactions`).
 
 ### `/orders` — list
 Table: PO#, supplier, order date, expected delivery, status badge, line count, total $. Filters: status, supplier, date range. Search: PO# or confirmation#. "+ New Order" top-right.
@@ -499,7 +523,17 @@ Header (PO#, conf#, supplier autocomplete, expected delivery), Order docs upload
 Read-only PO header + status badge. **Line item table renders the order's snapshot fields directly (`name`, `unitOfMeasure`, `quantityOrdered`, `quantityReceived`, `lotNumber`, `expirationDate`); never cross-references current `item.batches` or current `InventoryItem.unitOfMeasure`.** This locks in the historical-record contract: an order's line shows what was ordered/received then, not what the item looks like now. If `lineItems[i].itemId` no longer resolves (the item was deleted — possible per the narrowed `item-delete` rule above for received orders), render a "Item deleted" placeholder with the snapshotted name still visible. Attachments split: "Order docs" + "Receive docs" with download links. Action buttons by status: `placed` → Receive / Cancel / **"Edit (cancels original on save)"** (the button label is explicit about the consequence to avoid the abandonment trap — opens the recreate form with a banner reiterating that closing the tab without saving leaves the original active); `received` and `cancelled` → no actions. Activity timeline of related transactions.
 
 ### `/orders/:id/receive` — receive
-Editable received qty / lot / expiration per line; editable `actualReceiveDate` (defaults today, backdate up to 30 days); receive docs upload; Confirm. **On mount: if `order.status !== 'placed'`, redirect to `/orders/:id`** with a toast (handles bookmarked or stale links — see "Refresh mid-receive lands on a now-`received` PO" in Edge cases).
+Editable received qty / lot / expiration per line; editable `actualReceiveDate` (defaults today, backdate up to 30 days); receive docs upload; Confirm. **Pre-populates one row per `order.lineItems[i]`** with `quantityReceived` defaulting to `quantityOrdered`; users may zero rows but cannot add or remove them — the cross-schema check (`receivedLines` line-id-set === `order.lineItems` line-id-set) requires an exact 1:1 mapping. **Status-change redirect:**
+
+```ts
+useEffect(() => {
+  if (order && order.status !== 'placed') {
+    navigate(`/orders/${id}`, { replace: true });
+  }
+}, [order?.status, id, navigate]);
+```
+
+The dependency on `order?.status` (not empty `[]`) is intentional: it covers BOTH the bookmark/stale-link case (status was already not-placed at mount) AND the "user's own commit succeeds, status flips to received, re-render fires the redirect" case. There's no real-time push in this app, so a third-party-flipped-status mid-edit is currently impossible — but the rule is robust if that's added later.
 
 ### Dashboard additions
 - **Open Orders** card — count of `placed` POs, links to filtered list.
@@ -532,7 +566,9 @@ Matches existing inventory model:
 - At least one line item required.
 - Per line: `quantityOrdered > 0`, `unitCost >= 0`, `name` non-empty, `unitOfMeasure` non-empty.
 - Receive per line: `quantityReceived >= 0` integer; `lotNumber` non-empty AND `expirationDate` parseable IFF `quantityReceived > 0`. **Past expiration:** if `expirationDate < today`, the receive form shows an inline warning *"Lot expires before today — record reason"* and reveals an optional `pastExpirationReason` text field. The reason (if entered) is stored on the `OrderReceiveData.receivedLines[i].pastExpirationReason` field for compliance audit. Submitting with an empty reason is allowed but logged as `"(none provided)"`. Schema: `pastExpirationReason: z.string().optional()` on the per-line shape.
-- Receive header: `actualReceiveDate` defaults to today; user-editable; backdating up to 30 days allowed; future dates rejected. Validated as `z.string().regex(/^\d{4}-\d{2}-\d{2}$/).refine(isWithin30DaysPastOrToday)`.
+- Receive header: `actualReceiveDate` defaults to today; user-editable; backdating up to 30 days allowed; future dates rejected.
+  - **Schema-level (replay-stable):** `z.string().regex(/^\d{4}-\d{2}-\d{2}$/)` only. NO `.refine(isWithin30DaysPastOrToday)` at the schema layer — a transaction valid when written in May would become invalid 31 days later when re-read in June, dropping the `order-receive` event from `known` on every replay and silently reverting the order to status `placed`. Schema validation must be replay-stable.
+  - **UI/business-rule layer (form-submit only):** the receive form's submit handler enforces "today − 30 days ≤ actualReceiveDate ≤ today" against the user's local clock before constructing the transaction input. `validateTransaction('order-receive')` may also enforce this against `Date.now()` for newly-staged inputs (it never runs against historical events during replay), but the canonical check lives in the form.
 - Attachments: extension AND MIME both in allowed set; `sizeBytes <= 25 MB`. Reject before upload begins.
 - New `order-*` transactions enforced by Zod discriminated union; existing `validateTransaction()` switch in `transactionService.ts:87` extended with `order-create` (validates header + line items + ensures all `lineItems[].itemId` resolve), `order-receive` (validates target order is `placed`; received lines map to existing line ids), `order-cancel` (validates target order is `placed`).
 
@@ -558,6 +594,7 @@ Matches existing inventory model:
 - **Empty order folder when all attachments are removed before commit:** if a user adds attachments, uploads them, then removes them all (each cleanup deletes the file), the per-order folder created by `ensureOrderFolder()` may be left empty. The pruning script (`scripts/prune-order-attachments.ts`) handles this — empty folders for unknown order IDs are removed in the same pass. Not blocking; folders are cheap.
 - **Refresh mid-save creates duplicate stub items.** If the user submits an order with quick-add stubs and the network drops between server-processing and client-receiving the 200, the user might refresh the page before the retry-with-frozen-identity completes. On the next save attempt, fresh UUIDs/SKUs are minted (frozen-identity is per-batch, not per-logical-flow). PO# uniqueness blocks the duplicate ORDER, but the stub `item-create` events from the first attempt are already in the log AND the second attempt also writes its own stubs. Net result: 2× stubs for the same intended item. Cleanup is via the "Show stubs" toggle + manual delete. **Acceptable in v1**; documented here so users debugging "why are there two of this stub" know the cause. A v2 fix would require a session-stable identity token persisted in localStorage that survives refresh.
 - **Refresh mid-receive lands on a now-`received` PO.** Same shape as above: receive completes server-side, the user refreshes thinking it failed, the page reloads showing status `received` with `actualReceiveDate` just set. The receive form's `/orders/:id/receive` route detects status≠`placed` on mount and redirects to the detail page with a toast: *"This PO was received successfully — refreshing showed the latest state."* If the recently-received PO has `createdBy === currentUser` and `actualReceiveDate` within the last 5 minutes, the toast says *"You received this PO a moment ago — the previous attempt succeeded."* No data is lost; UX explains itself.
+- **`actualReceiveDate` typo is permanent.** Once an order is `received`, no edit path exists (received → no actions per detail-page rules). A typo in the receive-on date (e.g., 5/1 instead of 5/3) requires admin intervention (manual log edit through SharePoint) or a future v2 `order-amend` event type. Accepted v1 limit; documented for users debugging "how do I fix the receive date."
 
 ## Testing (Vitest, follows existing patterns under `src/**/__tests__/`)
 
@@ -565,7 +602,7 @@ Matches existing inventory model:
 - **`validateTransaction` case-table tests:** explicit assertions for each order type — `order-create` does NOT call `validateItemExists(input.itemId, items)` (would throw); `order-receive` rejects with target order in `received` or `cancelled` state; `order-cancel` rejects with target in `cancelled` state.
 - `deriveOrders.test.ts`: replay sequences produce expected order state for create / receive / cancel. Out-of-order or duplicate events are tolerated (idempotency). Defensive ignore: `item-*` referencing an order's UUID is logged and skipped; `order-*` referencing an unknown id same.
 - `deriveState.test.ts` invariant test: order ID set ∩ item ID set = ∅ on a representative log; intentional collision fixture verifies defensive-ignore path.
-- `appendTransactions.test.ts`: atomic batch write; 412-retry with backoff (mock the sleep); sequential staged validation (intra-batch dependencies enforced); incremental `applyTransaction` matches `deriveInventory(stagedLog)` on a 100-event fixture; perf test asserts <100ms validation on 50-line receive against a 10k-tx log generated at test setup via a deterministic seeded helper `generatePerfFixture(N: number, seed: number = 42)` using a small mulberry32/xorshift PRNG (NOT committed as a JSON fixture — keeps repo lean); idempotency cases — full-match no-op, partial-overlap throws `BatchPartiallyCommittedError`, intra-batch duplicate id throws `DuplicateInputIdError`, dup-itemId-on-order-events throws `DuplicateOrderIdError`, mismatched-id-reuse throws `IdReuseError`; **identity-frozen test** — simulate 412 conflict, assert all `id` and `sku` values in retry attempt match the first attempt; **Zod parse on write** — TS-typed but Zod-invalid input is rejected before write (e.g. malformed UUID, extra unknown key); **write-path strictness regression guard** — `validateItemUpdate({ quantity: 999 })` STILL throws (`.strict()` preserved on write-path schema despite read-path tolerance); **Cancel & Re-create race** — a concurrent placement of the same PO# between read and write fails the recreate's batch and surfaces a clear error; **AbortSignal** — cancel-during-retry aborts in-flight `graphFetch` (not in-flight token acquisition) and triggers attachment cleanup; **upload-session fallback** — `writeTransactionLog` with body >4MB switches to upload session, returns the new eTag.
+- `appendTransactions.test.ts`: atomic batch write; 412-retry with backoff (mock the sleep); sequential staged validation (intra-batch dependencies enforced); incremental `applyTransaction` matches `deriveInventory(stagedLog)` on a 100-event fixture; perf test asserts <100ms validation on 50-line receive against a 10k-tx log generated at test setup via a deterministic seeded helper `generatePerfFixture(N: number, seed: number = 42)` using a small mulberry32/xorshift PRNG (NOT committed as a JSON fixture — keeps repo lean); idempotency cases — full-match no-op, partial-overlap throws `BatchPartiallyCommittedError`, intra-batch duplicate id throws `DuplicateInputIdError`, dup-itemId-on-order-events throws `DuplicateOrderIdError`, mismatched-id-reuse throws `IdReuseError`; **identity-frozen test** — simulate 412 conflict, assert all `id` and `sku` values in retry attempt match the first attempt; **Zod parse on write** — TS-typed but Zod-invalid input is rejected before write (e.g. malformed UUID, extra unknown key); **write-path strictness regression guard** — `validateItemUpdate({ quantity: 999 })` STILL throws (`.strict()` preserved on write-path schema despite read-path tolerance); **Cancel & Re-create race** — a concurrent placement of the same PO# between read and write fails the recreate's batch and surfaces a clear error; **AbortSignal** — cancel-during-retry aborts in-flight `graphFetch` (not in-flight token acquisition) and triggers attachment cleanup; **upload-session fallback** — `writeTransactionLog` with body >4MB switches to upload session, returns the new eTag; **single-input shares batch path** — `appendTransaction(input)` is asserted to call `appendTransactions([input])` (mock `applyTransaction`, verify single invocation with the wrapped array) so retry/idempotency/raw-round-trip behaviors don't drift between the two surfaces.
 - **Stale-tab compat:** fixture writes a v2 log with order events; old-bundle reader reads it via `TransactionReadSchema` (`.passthrough()`-based), derives inventory minus orders correctly; old-bundle reader does a stock-in via `appendTransaction`; assert the round-tripped JSON contains all original `order-*` entries byte-identical (write-back preserves unknown entries from `data.transactions` raw array).
 - `orderService.test.ts`: create (with and without quick-add items), receive (full / short / zero / over per line), cancel. Verify `stock-in` emissions match non-zero received lines and that batches land on correct items via `deriveInventory`. **Cancel & Re-create batch ordering:** `orderService.cancelAndRecreate(...)` always emits `[itemCreates..., orderCancel(predecessor), orderCreate(replacement)]` in that order; reversing order would fail PO#-uniqueness; helper hard-codes the order. `replacedBy` and `note: "Replaced by PO-..."` populated on the cancel transaction.
 - **Cancel & Re-create vs Receive race:** fixture where two batches target the same order; assert the loser surfaces a clear status-mismatch error after retry.
