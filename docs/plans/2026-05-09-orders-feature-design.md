@@ -1,7 +1,7 @@
 # Orders Feature Design
 
 **Date:** 2026-05-09
-**Status:** Design (revised after independent review), ready for implementation plan
+**Status:** Design (revised after independent Codex review + adversarial Opus 4.7 review), ready for implementation plan
 
 ## Overview
 
@@ -48,11 +48,16 @@ export type TransactionType =
 
 For `order-*` events, the existing `itemId: uuid` field is reinterpreted as the **order's UUID**. The Zod base schema already enforces UUID format, so no schema relaxation is needed; we document the reinterpretation in `transaction.ts`. `stock-in` transactions emitted from a receive event carry a new optional `orderId?: string` on `StockData` for traceability back to the originating PO.
 
+**ID-space disjointness.** Order UUIDs and item UUIDs are both `crypto.randomUUID()` outputs from the same v4 generator, so collision probability is `2⁻¹²² × N²` — astronomically negligible. But because the two ID spaces share the same field name (`itemId`), a collision is silently catastrophic: an `item-delete` against an order's UUID would not raise an error, and `deriveOrders` would not see anything wrong. Guards:
+
+1. **Defensive ignore in `deriveOrders`.** If the input is an `item-*` or `stock-*` transaction whose `itemId` matches a known order, log a console warning and ignore for order derivation purposes (and vice versa). Treat unknown order references in `order-*` events the same way (warn + ignore, do not throw — keeps the log replayable).
+2. **Invariant unit test.** `deriveState.test.ts` adds an explicit test asserting the union of derived order IDs and derived item IDs is disjoint, with a fixture that intentionally produces a collision and verifies the defensive-ignore branch fires.
+
 Three new data payload schemas (Zod):
 
-- `OrderCreateDataSchema` — header fields + `lineItems[]` + `attachments[]` (placement docs)
-- `OrderReceiveDataSchema` — `receivedLines[]` (line id, quantityReceived, lotNumber?, expirationDate?) + `attachments[]` (receive docs) + `actualReceiveDate`
-- `OrderCancelDataSchema` — `note?`
+- `OrderCreateDataSchema` — header fields + `lineItems[]` + `attachments[]` (placement docs). Per-line refinements: `quantityOrdered > 0`, `unitCost >= 0`, `name` and `unitOfMeasure` non-empty, `id` is a UUID and unique within the array.
+- `OrderReceiveDataSchema` — `receivedLines[]` (line id, quantityReceived, lotNumber?, expirationDate?) + `attachments[]` (receive docs) + `actualReceiveDate`. Per-line Zod refinements: `quantityReceived` is a non-negative integer; `lotNumber` non-empty AND `expirationDate` parseable IFF `quantityReceived > 0`. **Cross-schema check** (cannot live purely in Zod since it needs the target order's `lineItems`): in `validateTransaction()` for `order-receive`, assert `receivedLines.length === order.lineItems.length` AND `receivedLines.map(r => r.id).sort() ≡ order.lineItems.map(l => l.id).sort()`. An empty `receivedLines` array is rejected with a `ReceiveCoverageError` — submitting "receive nothing" is forbidden; users must use Cancel for that.
+- `OrderCancelDataSchema` — `note?`. Optional `replacedBy?: string` carries the new order's UUID when cancellation is part of a Cancel & Re-create batch (informational only — no derivation depends on it).
 
 These join the existing `TransactionSchema` discriminated union in `src/models/schemas.ts`.
 
@@ -114,7 +119,7 @@ In `deriveInventory()`, the `item-create` branch reads the (now defaulted) `unit
 
 - `src/mock/data.ts` — add `unitOfMeasure` to mock items
 - `src/pages/NewItem.tsx` — UoM input
-- `src/pages/ItemDetail.tsx` — display + edit
+- `src/pages/ItemDetail.tsx` — display + edit. **Important:** because `ItemUpdateDataSchema` validates `unitOfMeasure` as `z.string().min(1).optional()`, the edit form must convert empty-string back to `undefined` before submitting (otherwise editing any other field on an item with the UoM input bound to `''` will fail Zod with "String must contain at least 1 character"). The submit handler does `unitOfMeasure: form.unitOfMeasure?.trim() || undefined`. Same treatment for any other `string().min(1).optional()` field on the form.
 - `src/pages/InventoryList.tsx` — optional column
 - CSV import (`src/pages/Import.tsx`) — optional column with `'each'` default
 - CSV export (`src/pages/Export.tsx`) — include in template
@@ -158,30 +163,49 @@ instead of returning just `InventoryItem[]`. This lets `InventoryContext` update
 
 ### `appendTransactions(inputs[])` — batch atomic write
 
-New helper in `src/api/transactionService.ts` alongside the existing `appendTransaction()`. Same retry / ETag loop as `appendTransaction`, but appends ALL inputs in one write.
+New helper in `src/api/transactionService.ts` alongside the existing `appendTransaction()`. Same shape as `appendTransaction`'s retry/ETag loop, with three changes documented below: **input identity is frozen before the loop**, **retries use exponential backoff with jitter**, and **staged validation is incremental, not O(N²)**.
 
-**Sequential staged validation.** Each input is validated against an incrementally staged log so that intra-batch dependencies are enforced (e.g., a quick-add `item-create` must be visible to the subsequent `order-create`'s line-item check; an `order-receive`'s `stock-in` lines must be valid against the receiving order's state).
+**Input identity is frozen before the retry loop.** All UUIDs (`tx.id`, stub item `id`, stub item `sku`) are generated by the CALLER before `appendTransactions` is invoked, and are NEVER regenerated inside the retry loop. The plan's idempotency rules assume input is stable across retries — without this, a 412 retry that re-rolls a stub `sku` (after a collision detected against newly-read state) would produce a different `item-create` payload, breaking the "full-match no-op" path. **SKU collision policy:** if the caller's pre-rolled `sku` collides with a SKU already in the log when the staged loop checks `validateItemCreate`, throw a `StubSkuCollisionError` rather than re-roll. The 24-bit space (`SKU-<6 hex>`) makes collision astronomically unlikely; surface it to the user for the rare case rather than retry silently.
+
+**Retry/backoff strategy.**
 
 ```ts
-const stagedLog = [...log.transactions];
+const MAX_RETRIES = 6;                 // existing const lifts from 3 → 6 for batch writes
+const BASE_DELAY  = 50;                // ms
+// On 412:
+await sleep(BASE_DELAY * 2 ** attempt + Math.random() * BASE_DELAY);
+```
+
+This is jittered exponential backoff (50, ~110, ~250, ~550, ~1150, ~2350 ms). Without backoff the existing `while (retries <= MAX_RETRIES)` (`transactionService.ts:41-79`) ping-pongs through ETag conflicts in <100 ms under contention and exhausts retries before any natural staggering can resolve them. The cap of 6 attempts puts the worst-case wall time at ~5 seconds, surfaced to the user as a transient conflict error with a "Try again" button. `appendTransaction()` (single-input) gets the same backoff treatment — it's a strict win.
+
+**Sequential staged validation, incremental.** Intra-batch dependencies must be enforced (e.g., a quick-add `item-create` must be visible to the subsequent `order-create`'s line-item check). Naive `deriveInventory(stagedLog)` per input is O(N²) on the full log; for a 50-line receive against a 5,000-tx log that's ~250k replay-steps × retries — browser-jank territory. Instead, derive base state ONCE and incrementally apply each staged input.
+
+```ts
+let stagedItems  = deriveInventory(log.transactions);
+let stagedOrders = deriveOrders(log.transactions);
+
 for (const input of inputs) {
-  const stagedItems  = deriveInventory(stagedLog);
-  const stagedOrders = deriveOrders(stagedLog);
-  validateTransaction(input, stagedItems, stagedOrders); // extended signature
-  stagedLog.push(buildTransaction(input));
+  parseTransactionInput(input);                               // Zod parse — see "input parsing" below
+  validateTransaction(input, stagedItems, stagedOrders);      // business rules
+  ({ items: stagedItems, orders: stagedOrders } =
+    applyTransaction(input, stagedItems, stagedOrders));      // pure incremental update
 }
 ```
+
+`applyTransaction(input, items, orders)` is a new pure helper extracted from the inner switch of `deriveInventory`/`deriveOrders` — it returns the post-input `{ items, orders }` without re-replaying. A perf test exercises N=50 lines on a 10k-transaction log and asserts <100 ms total validation time.
+
+**Input parsing — defense in depth.** `parseTransactionInput(input)` runs `TransactionSchema.parse(...)` (with synthetic `performedBy` / `timestamp` if not yet stamped) before business-rule validation. Today the existing `appendTransaction()` only validates business rules — Zod parsing happens at READ time (`fileOperations.ts:38`). A buggy `orderService` could write a TS-typed but Zod-invalid payload that then fails parse on the next read for everyone. Parsing on write closes that gap. Add to test list.
 
 `validateTransaction()` (`src/api/transactionService.ts:87`) signature is extended to accept `(input, items, orders)`. New cases for `order-create` / `order-receive` / `order-cancel` consult `orders` for preconditions like "target order exists and is `placed`", "PO# is not in use by a non-cancelled order", "all line items resolve to existing inventory items at this point in the batch".
 
 **Idempotency rules** (precise):
 
 - **Pre-input duplicate-id check.** If two inputs in the batch share an `id`, throw `DuplicateInputIdError` immediately (programmer error).
-- **Full-match no-op.** If ALL input IDs already exist in the persisted log AND the persisted transactions match the inputs (same `type`, `itemId`, `data`), return the current derived state without writing — this is the idempotent retry path.
+- **Full-match no-op.** If ALL input IDs already exist in the persisted log AND the persisted transactions match the inputs (same `type`, `itemId`, `data`), return the current derived state without writing — this is the idempotent retry path. Relies on the frozen-identity rule above.
 - **Partial overlap.** If a STRICT SUBSET of input IDs exist in the log, throw `BatchPartiallyCommittedError`. Caller decides whether to surface as a conflict or retry with new IDs.
 - **Mismatched id reuse.** If an input ID exists in the log but with different `type`/`itemId`/`data`, throw `IdReuseError`.
 
-ETag conflicts (412) re-trigger the entire validate-and-stage loop with the freshly-read log.
+ETag conflicts (412) re-trigger the entire validate-and-stage loop with the freshly-read log AND the backoff sleep above.
 
 ### `orderService.ts` — new file
 
@@ -216,9 +240,9 @@ Mirrors `src/api/imageOperations.ts`: sanitize, prefix uuid, PUT to SharePoint, 
 3. **Order docs** section (optional): drag/drop area. Files are kept in browser memory (not uploaded yet) — see "Attachment lifecycle" below.
 4. Add line items one row at a time:
    - **Item picker:** typeahead search on existing inventory by name/SKU.
-   - On selecting an existing item: `findLatestLineItemForItem(itemId)` autofills `name`, `unitOfMeasure`, `unitCost`, `quantityOrdered`. If no prior order exists for this item, fall back to the item's `unitCost` and `unitOfMeasure`.
+   - On selecting an existing item: `findLatestLineItemForItem(itemId)` autofills `name`, `unitOfMeasure`, `unitCost`, `quantityOrdered`. **Searches only non-cancelled orders** (`status !== 'cancelled'`) — autofilling from a cancelled order's typo'd qty/cost would propagate the same mistake the user just cancelled. If no prior non-cancelled order exists for this item, fall back to the item's `unitCost` and `unitOfMeasure`.
    - On "+ Create new item" (no match): inline mini-form with **name**, **unit of measure**, **unit cost**. App generates a stub `ItemCreateData` with these defaults to satisfy the existing `ItemCreateDataSchema`:
-     - `sku`: `SKU-<6 random hex>` (re-rolled on collision)
+     - `sku`: `SKU-<6 random hex>` (rolled ONCE before the save batch enters the retry loop; a collision against the post-batch staged log is surfaced as `StubSkuCollisionError` rather than silently re-rolled — see "Input identity is frozen before the retry loop" above)
      - `quantity`: 0
      - `location`: `'Unspecified'`
      - `category`: `'Uncategorized'`
@@ -228,6 +252,7 @@ Mirrors `src/api/imageOperations.ts`: sanitize, prefix uuid, PUT to SharePoint, 
      - `reorderPoint`: 0
      - `unitCost`: as entered on the line
      - `unitOfMeasure`: as entered on the line
+     - `isStub: true` — see "Stub items in the inventory list" below
      The user can refine these on `/inventory/:id` later. Any newly-created stub items are emitted as `item-create` transactions in the same atomic batch as `order-create`.
 5. User edits qty/cost per line freely. Live total at bottom.
 6. Save → upload all staged attachments (see lifecycle below) → call `createOrder` → `appendTransactions([...itemCreates, orderCreate])`.
@@ -256,14 +281,19 @@ Receive is single-event: one click closes the PO. No partial-receive-across-mult
 
 The naive approach — uploading on file drop, before the order is saved — leaks files when the user cancels or validation fails. Instead, files transition through three states: **staged → uploaded → committed**. Cleanup is required at every transition where a file is abandoned.
 
-1. **Staged (in memory).** When the user adds a file, keep the `File` object in component state. Show in the UI as a chip with name, size, ✕ remove. No SharePoint call yet.
+1. **Staged (in memory).** When the user adds a file, keep the `File` object in component state. Show in the UI as a chip with name, size, ✕ remove. No SharePoint call yet. **De-duplication:** before adding a new staged file, check the existing staged + uploaded lists for an entry with the same `name` AND `size` (cheap heuristic, no hashing). If a match is found, prompt: *"This looks like the same file you already added. Replace, keep both, or skip?"* — default to "Skip". Avoids accidental double-uploads when users drag a file twice.
 2. **Upload phase (on Save click).** Generate `orderId` upfront so paths are stable. Sequentially upload all staged files via `uploadOrderAttachment(orderId, file, stage)`, calling `ensureOrderFolder(orderId)` once before the first upload. As each completes, move it to an `uploadedAttachments` list in component state. On per-file upload failure: show inline error, leave already-uploaded files in the uploaded list, let the user retry/remove the failed file. The order transaction is NOT committed yet.
 3. **Commit phase.** Once all files are in `uploadedAttachments`, call `appendTransactions(...)` with the order transaction(s) that reference those filenames.
 4. **Cleanup triggers** — any of these abandons the in-flight upload state and must DELETE the `uploadedAttachments` files (best-effort, fire-and-forget):
    - **User clicks Cancel** on the form.
    - **Commit fails** (`appendTransactions` throws after exhausting retries). The user is shown the error with two buttons: "Retry" (re-attempts commit using the same uploaded files) and "Discard" (cleanup + close form). On unmount-before-decision, default to Discard.
    - **Component unmount or navigation away** without an explicit Cancel/Retry decision — `useEffect` cleanup fires DELETE for `uploadedAttachments`.
-   - **Tab close / page refresh** — `navigator.sendBeacon` does NOT fit here: there is no backend endpoint and the call cannot carry a Graph bearer token reliably. Instead, use `fetch(graphDeleteUrl, { method: 'DELETE', headers: { Authorization: 'Bearer ' + cachedToken }, keepalive: true })` for each `uploadedAttachments` entry, fired from a `beforeunload` listener IFF a usable token is in MSAL's silent cache. If token acquisition would require interaction (popup), skip — orphans here are rare and acceptable. Documented as best-effort with admin pruning fallback (the `/InventoryApp/orders/<orderId>/` folder is browsable in SharePoint, so an admin can periodically prune orphaned files for orders that don't exist in the transaction log).
+   - **Tab close / page refresh** — best-effort and explicitly NOT relied on. Implementation: a `beforeunload` AND `pagehide` listener (the latter for Safari/iOS) fires `fetch(graphDeleteUrl, { method: 'DELETE', headers: { Authorization: 'Bearer ' + cachedToken }, keepalive: true })` for each `uploadedAttachments` entry — but ONLY if a non-expired access token is already in MSAL's in-memory cache (checked via `acquireTokenSilent` with a synchronous-only fast path; if that would require iframe/popup/redirect, we skip). MSAL has no public sync API for "is there a token without I/O", so the implementation tries `acquireTokenSilent({ forceRefresh: false })` synchronously and treats any awaited promise resolution after the unload as a no-op. The `keepalive` flag has a 64 KB body cap which is not a concern for DELETE. **Tab close cleanup is documented as a courtesy, not a guarantee.**
+   - **Logout** — if the user signs out while files are in `uploadedAttachments`, the auth context evaporates and DELETE will fail. Treat the same as tab-close: best-effort, no error to user, admin pruning catches it.
+
+The canonical fallback for orphaned files is **admin pruning**. Bundled with this feature:
+
+- **`scripts/prune-order-attachments.ts`** (new file) — a Node script intended to run from a maintainer's terminal, not in the browser. Reads `transactions.json` via Graph, derives the set of valid `orderId`s via `deriveOrders`, lists all subfolders under `/InventoryApp/orders/`, and DELETEs any folder whose `orderId` is not in the valid set. Prints a dry-run report by default; `--apply` actually deletes. Documented in README under "Maintenance".
 5. **Receive flow:** same lifecycle, but uploads go into the existing order's folder; `ensureOrderFolder(orderId)` is still called (idempotent) in case the placement flow had no attachments.
 
 Once a transaction is committed, the files are referenced by the persisted log and must NOT be deleted by this lifecycle — they're the source of truth for the order's attachments going forward.
@@ -302,7 +332,7 @@ cancelOrder(id, note?): Promise<Order>;
 findLatestLineItemForItem(itemId): OrderLineItem | null;
 ```
 
-(`useInventoryData()` exists but is currently unused; we leave it alone — the bootstrap above subsumes its job.)
+**`useInventoryData` removal.** `src/hooks/useInventoryData.ts` exists but has no callers (verified via grep against the worktree). The new bootstrap subsumes its responsibility. We DELETE the hook in step 0a rather than "leave it alone" — keeping it creates dead code that looks reachable to a future reader and could drift out of sync with the bootstrap. Tests covering the hook (if any) are deleted with it.
 
 ### `/orders` — list
 Table: PO#, supplier, order date, expected delivery, status badge, line count, total $. Filters: status, supplier, date range. Search: PO# or confirmation#. "+ New Order" top-right.
@@ -311,28 +341,31 @@ Table: PO#, supplier, order date, expected delivery, status badge, line count, t
 Header (PO#, conf#, supplier autocomplete, expected delivery), Order docs upload, line items rows, live total, Save / Cancel.
 
 ### `/orders/:id` — detail
-Read-only PO header + status badge. Line item table (incl. qty received, lot, expiration when received). Attachments split: "Order docs" + "Receive docs" with download links. Action buttons by status: `placed` → Receive / Cancel / "Cancel & Re-create" (pre-fills the new-order form, then cancel + create are committed as one batch on save); `received` and `cancelled` → no actions. Activity timeline of related transactions.
+Read-only PO header + status badge. Line item table (incl. qty received, lot, expiration when received). Attachments split: "Order docs" + "Receive docs" with download links. Action buttons by status: `placed` → Receive / Cancel / **"Edit (cancels original on save)"** (the button label is explicit about the consequence to avoid the abandonment trap — opens the recreate form with a banner reiterating that closing the tab without saving leaves the original active); `received` and `cancelled` → no actions. Activity timeline of related transactions.
 
 ### `/orders/:id/receive` — receive
 Editable received qty / lot / expiration per line; receive docs upload; Confirm.
 
 ### Dashboard additions
 - **Open Orders** card — count of `placed` POs, links to filtered list.
-- **Overdue Orders** callout — `placed` POs whose `expectedDeliveryDate` < today.
+- **Overdue Orders** callout — `placed` POs whose `expectedDeliveryDate` < today. **Mock data note:** if the orders feature is exposed in dev mode, `src/mock/data.ts` mock orders compute `expectedDeliveryDate` as `today + N days` at module load (using a small helper `daysFromToday(n)`), NOT hardcoded ISO strings. Hardcoded mock dates will become "overdue" the day after a commit and pollute the dashboard for every dev who pulls.
 
 ### Activity feed updates (`src/pages/Dashboard.tsx`)
-The current activity feed at `src/pages/Dashboard.tsx:101` only renders item/stock transaction types and falls through to a no-render default for unknown types. Order events would otherwise appear blank. Two updates:
+The current activity feed at `src/pages/Dashboard.tsx:101` only renders item/stock transaction types and falls through to a no-render default for unknown types. Order events would otherwise appear blank. Three updates:
 
-1. Extend `typeConfig` (`src/pages/Dashboard.tsx:105`) with entries for `order-create`, `order-receive`, `order-cancel` (icons + class).
-2. Extend `renderText()` (`src/pages/Dashboard.tsx:118`): for order-* events, look up the order via `orders.find(o => o.id === tx.itemId)` instead of `items.find` (since `tx.itemId` is the order's UUID for these types). Render messages like *"Placed PO-2026-0101 to Qiagen — 3 lines"*, *"Received PO-2026-0101 — 3 batches added"*, *"Cancelled PO-2026-0101"*.
+1. **Move `tx.data` casts inside each `case`.** Today `renderText()` reads `(tx.data as StockData).quantity` and `(tx.data as StockData).note` UNCONDITIONALLY at `src/pages/Dashboard.tsx:120-121`, BEFORE the switch. This works by accident for current types because `quantity` happens to be a property of `ItemCreateData` too, but adding `order-*` types newly exposes the bug: `OrderCreateData.quantity` doesn't exist (only `lineItems[i].quantityOrdered`), and the `note` cast on `OrderCreateData` would read undefined or worse if a future schema change shifts the field. The fix is independent of the order rollout but MUST be done in the same step: each `case` extracts the data it needs (`const d = tx.data as StockData;` inside the case), the unconditional reads at lines 120-121 are removed.
+2. Extend `typeConfig` (`src/pages/Dashboard.tsx:105`) with entries for `order-create`, `order-receive`, `order-cancel` (icons + class).
+3. Extend `renderText()` (`src/pages/Dashboard.tsx:118`): for order-* events, look up the order via `orders.find(o => o.id === tx.itemId)` instead of `items.find` (since `tx.itemId` is the order's UUID for these types). Render messages like *"Placed PO-2026-0101 to Qiagen — 3 lines"*, *"Received PO-2026-0101 — 3 batches added"*, *"Cancelled PO-2026-0101"*.
 
 `stock-in` rows emitted from a receive event continue to render normally; if `tx.data.orderId` is present, append `"(via PO-...)"` for traceability.
 
-## Permissions
+## Permissions & threat model
 
 Matches existing inventory model:
 - All authenticated users: create, edit, receive, cancel orders; upload/delete attachments on placed orders.
-- Admin only (client-side enforcement, same as existing CSV import): delete attachments from `received` or `cancelled` orders. (Note: SharePoint-side permissions are not split per-folder; this is enforced via the same `isAdmin()` gate used for import.)
+- Admin only (client-side enforcement, same as existing CSV import): delete attachments from `received` or `cancelled` orders. Enforced via the same `isAdmin()` gate used for import.
+
+**Threat model — explicit acknowledgement.** Permissions above are **UX gates, not security boundaries**. Any authenticated user holds a Graph token with `Sites.ReadWrite.All` scoped to the configured SharePoint site (per `src/auth/msalConfig.ts`'s `loginScopes`). They could bypass the UI and directly DELETE any file under `/InventoryApp/orders/...`, or PUT a doctored `transactions.json` with someone else's `performedBy` email. The intended user population is a 5-person biolab team, all with similar trust level — matching the threat model the existing `transactions.json` design already accepts. If a future deployment needs hardened multi-tenant isolation, that requires per-folder SharePoint permission splits and a backend signing layer; both are explicitly out of scope (listed in YAGNI).
 
 ## Validation (Zod + business rules)
 
@@ -341,7 +374,7 @@ Matches existing inventory model:
 - `supplier`: required.
 - At least one line item required.
 - Per line: `quantityOrdered > 0`, `unitCost >= 0`, `name` non-empty, `unitOfMeasure` non-empty.
-- Receive per line: `quantityReceived >= 0` integer; `lotNumber` non-empty AND `expirationDate` parseable IFF `quantityReceived > 0`. Past expiration warns (does not block).
+- Receive per line: `quantityReceived >= 0` integer; `lotNumber` non-empty AND `expirationDate` parseable IFF `quantityReceived > 0`. **Past expiration:** if `expirationDate < today`, the receive form shows an inline warning *"Lot expires before today — record reason"* and reveals an optional `pastExpirationReason` text field. The reason (if entered) is stored on the `OrderReceiveData.receivedLines[i].pastExpirationReason` field for compliance audit. Submitting with an empty reason is allowed but logged as `"(none provided)"`. Schema: `pastExpirationReason: z.string().optional()` on the per-line shape.
 - Attachments: extension AND MIME both in allowed set; `sizeBytes <= 25 MB`. Reject before upload begins.
 - New `order-*` transactions enforced by Zod discriminated union; existing `validateTransaction()` switch in `transactionService.ts:87` extended with `order-create` (validates header + line items + ensures all `lineItems[].itemId` resolve), `order-receive` (validates target order is `placed`; received lines map to existing line ids), `order-cancel` (validates target order is `placed`).
 
@@ -350,24 +383,32 @@ Matches existing inventory model:
 - **Short-receive** (received < ordered, > 0): allowed, recorded as-is. Order moves to `received`. Detail shows `"7 of 10 received"`.
 - **Zero-receive** (received === 0): allowed; line emits NO `stock-in`; `lotNumber`/`expirationDate` not required for that line.
 - **Over-receive** (received > ordered): allowed with confirmation prompt. Recorded as-is.
-- **Editing a placed order:** v1 has NO direct edit. The detail page exposes a "Cancel & Re-create" button on `placed` POs that pre-fills `/orders/new` with the current PO's data (including the PO# — reusable since the predecessor will be cancelled) and emits the cancel + recreate as a single `appendTransactions` batch when saved. (Avoids adding an `order-update` event type for v1; revisit if users hit friction.)
-- **Stub items from a cancelled order:** stay in inventory with qty 0. User deletes manually. Not auto-cleaned.
+- **Editing a placed order:** v1 has NO direct edit. The detail page exposes a "Cancel & Re-create" button on `placed` POs that pre-fills `/orders/new` with the current PO's data (including the PO# — reusable since the predecessor will be cancelled) and emits the cancel + recreate as a single `appendTransactions` batch when saved. The cancel transaction's `note` is auto-filled with `"Replaced by PO-<new-po-number>"` and `replacedBy` carries the new order's UUID. The recreate form shows a banner: *"Editing PO-2026-0101 — saving will cancel the original and create a replacement. Closing this tab without saving leaves the original active."* (Avoids adding an `order-update` event type for v1; revisit if users hit friction.)
+- **Cancel & Re-create — concurrent PO# race:** if another user places PO-100 in the gap between the user clicking "Cancel & Re-create" on their own PO-100 and clicking Save, the recreate's batch fails the staged-validation PO# uniqueness check (since the new PO-100 is now active and uncancelled). Surfaced to the user as: *"PO-100 was just claimed by someone else. Pick a new number or cancel this edit."* Test case in `appendTransactions.test.ts`.
+- **Stub items in the inventory list:** quick-add stubs default to `quantity: 0`, `location: 'Unspecified'`, `category: 'Uncategorized'`, and a new `isStub: boolean` flag set by the `item-create` payload. Add `isStub` to `InventoryItem`, `ItemCreateData`, and `ItemUpdateData` (the latter is how the user "graduates" a stub by editing the placeholders — saving real `location`/`category` flips `isStub` to `false`). `ItemUpdateDataSchema` validates `isStub: z.literal(false).optional()` (only forward graduation; cannot manually re-stub). `/inventory` and the dashboard's low-stock alert filter out `isStub === true` by default; the list page gets a "Show stubs (N)" toggle. Stubs with positive quantity (received against a still-stub item) flip `isStub` to `false` automatically in `deriveInventory` since `'Unspecified'` location / 0 reorder point are no longer accurate signals.
+- **Stub items from a cancelled order:** stay in inventory with qty 0. Visible only via the "Show stubs" toggle. User deletes manually. Not auto-cleaned.
 - **Concurrent edits / conflict:** existing `appendTransaction` retry loop handles 412 by re-deriving and re-validating. `appendTransactions` does the same. PO# uniqueness is re-checked after retry, so a concurrent PO# can be detected.
 - **Attachment upload failure mid-save:** see "Attachment lifecycle" — staged files retried independently; order commit happens only after upload phase resolves.
 - **Cancelled order with attachments:** files stay on SharePoint and remain accessible from the detail page.
+- **Empty order folder when all attachments are removed before commit:** if a user adds attachments, uploads them, then removes them all (each cleanup deletes the file), the per-order folder created by `ensureOrderFolder()` may be left empty. The pruning script (`scripts/prune-order-attachments.ts`) handles this — empty folders for unknown order IDs are removed in the same pass. Not blocking; folders are cheap.
 
 ## Testing (Vitest, follows existing patterns under `src/**/__tests__/`)
 
-- Schema validation: `OrderCreateData`, `OrderReceiveData`, `OrderCancelData` accept valid shapes, reject invalid (e.g., `quantityOrdered <= 0`, missing lot when `quantityReceived > 0`).
-- `deriveOrders.test.ts`: replay sequences produce expected order state for create / receive / cancel. Out-of-order or duplicate events are tolerated (idempotency).
-- `appendTransactions.test.ts`: atomic batch write; 412-retry; sequential staged validation (intra-batch dependencies enforced); idempotency cases — full-match no-op, partial-overlap throws `BatchPartiallyCommittedError`, intra-batch duplicate id throws `DuplicateInputIdError`, mismatched-id-reuse throws `IdReuseError`.
-- `orderService.test.ts`: create (with and without quick-add items), receive (full / short / zero / over per line), cancel. Verify `stock-in` emissions match non-zero received lines and that batches land on correct items via `deriveInventory`.
-- `validation.test.ts`: receive validation (lot/exp required gating on received qty).
-- `unitOfMeasure` migration: replaying old `item-create` transactions defaults to `'each'`; replaying old `item-update` transactions does NOT inject `unitOfMeasure` (preserves the previously-set value); new transactions persist user-selected value; CSV import treats column as optional.
-- Attachment validation: rejects oversized, disallowed ext, mismatched MIME.
-- Attachment cleanup: on commit-failure path, uploaded files are DELETEd (best-effort); on user Cancel, uploaded files are DELETEd; on form unmount without explicit decision, cleanup fires.
+- Schema validation: `OrderCreateData`, `OrderReceiveData`, `OrderCancelData` accept valid shapes, reject invalid (e.g., `quantityOrdered <= 0`, missing lot when `quantityReceived > 0`, empty `receivedLines`, mismatched line ids between receive and target order).
+- `deriveOrders.test.ts`: replay sequences produce expected order state for create / receive / cancel. Out-of-order or duplicate events are tolerated (idempotency). Defensive ignore: `item-*` referencing an order's UUID is logged and skipped; `order-*` referencing an unknown id same.
+- `deriveState.test.ts` invariant test: order ID set ∩ item ID set = ∅ on a representative log; intentional collision fixture verifies defensive-ignore path.
+- `appendTransactions.test.ts`: atomic batch write; 412-retry with backoff (mock the sleep); sequential staged validation (intra-batch dependencies enforced); incremental `applyTransaction` matches `deriveInventory(stagedLog)` on a 100-event fixture; perf test asserts <100ms validation on 50-line receive against a 10k-tx log; idempotency cases — full-match no-op, partial-overlap throws `BatchPartiallyCommittedError`, intra-batch duplicate id throws `DuplicateInputIdError`, mismatched-id-reuse throws `IdReuseError`; **identity-frozen test** — simulate 412 conflict, assert all `id` and `sku` values in retry attempt match the first attempt; **Zod parse on write** — TS-typed but Zod-invalid input is rejected before write (e.g. malformed UUID, extra unknown key); **Cancel & Re-create race** — a concurrent placement of the same PO# between read and write fails the recreate's batch and surfaces a clear error.
+- `orderService.test.ts`: create (with and without quick-add items), receive (full / short / zero / over per line), cancel. Verify `stock-in` emissions match non-zero received lines and that batches land on correct items via `deriveInventory`. Cancel & Re-create as one batch reuses PO#; `replacedBy` and `note` populated on the cancel transaction.
+- `findLatestLineItemForItem.test.ts`: returns the most recent line from a non-cancelled order; returns null if all matching orders are cancelled; returns null with no prior orders.
+- `validation.test.ts`: receive validation (lot/exp required gating on received qty); empty `receivedLines` rejected; past expiration warning + optional reason field.
+- `unitOfMeasure` migration: replaying old `item-create` transactions defaults to `'each'`; replaying old `item-update` transactions does NOT inject `unitOfMeasure` (preserves the previously-set value); new transactions persist user-selected value; CSV import treats column as optional. **`ItemDetail` form test:** submit with `unitOfMeasure: ''` — handler converts to `undefined` before submit, schema accepts.
+- `Dashboard.test.tsx`: order events render correct text; cast-inside-case refactor — replaying a fixture with mixed transaction types does not throw on the unconditional-read removed at line 120-121; `isStub` items hidden by default with toggle to show them.
+- Attachment validation: rejects oversized, disallowed ext, mismatched MIME; de-duplicates on `name + size`.
+- Attachment cleanup: on commit-failure path, uploaded files are DELETEd (best-effort); on user Cancel, uploaded files are DELETEd; on form unmount without explicit decision, cleanup fires; logout fires the same cleanup path; tab-close best-effort attempt is documented and tested with a mocked `pagehide`/`beforeunload` listener (assertion: cleanup is queued, not awaited).
 - Bootstrap: `/orders/` folder creation tolerates 409/412; `ensureOrderFolder` is idempotent across repeated calls in one flow.
-- `InventoryContext` bootstrap: in mock mode (no MSAL config), context loads mocks; in SharePoint mode, context derives state from `transactions.json` and `mockItems`/`mockTransactions` are NOT read.
+- `InventoryContext` bootstrap: in mock mode (no MSAL config), context loads mocks; in SharePoint mode, context derives state from `transactions.json` and `mockItems`/`mockTransactions` are NOT read; `useInventoryData` is removed (build fails if any caller is added later).
+- `scripts/prune-order-attachments.ts`: dry-run lists folders that would be deleted; `--apply` only deletes folders whose `orderId` is absent from `deriveOrders(log)`; tolerates concurrent writes (re-reads and skips folders that became valid mid-run).
+- **Production-caller assertion (step 0a):** automated check (`scripts/check-no-old-write-result.ts` or a unit test) greps `src/` for any reference to the OLD `appendTransaction()` return-shape (`Promise<InventoryItem[]>`) and fails the build if found.
 
 ## Out of scope (YAGNI)
 - Multi-lot per line at receive time
@@ -381,11 +422,14 @@ Matches existing inventory model:
 ## Implementation order (suggested)
 
 0. **Unify MSAL** (pre-req). Refactor so a single `PublicClientApplication` is initialized once and reused by `transactionService`. Verify via a smoke test that `appendTransaction` works end-to-end against SharePoint when MSAL is configured.
-0a. **SharePoint-mode `InventoryContext` bootstrap** (pre-req). On provider mount in MSAL-configured mode, run `initializeDataStore()` + `readTransactionLog()` and derive `items`/`orders` from the log instead of using mocks. Migrate the existing item/stock mutator methods to delegate to `appendTransaction()` in SharePoint mode (turning callers async — the touched pages are NewItem, ItemDetail, StockForm, Import). Mock-mode behavior is unchanged. Standalone PR-shaped step.
-1. `unitOfMeasure` field rolled out across model, schemas (create has `.default('each')`, update has `.optional()` with NO default), derive, mock, NewItem/ItemDetail/InventoryList, CSV import/export. Tests + docs. *(Touches the most files; standalone.)*
-2. Transaction model: add `order-create` / `order-receive` / `order-cancel` types + Zod schemas. Extend `validateTransaction()` signature to `(input, items, orders)` and add cases for the new types. `appendTransactions()` helper with sequential staged validation + idempotency rules + tests.
-3. `deriveOrders()` + `Order` types + `orderService` (create / cancel only at this stage) + tests.
-4. `/orders` list, `/orders/new`, `/orders/:id` (without attachments, without receive). End-to-end flow for placed POs. Activity feed gets `order-create` / `order-cancel` rendering.
-5. Receive flow: `receiveOrder` in service, `/orders/:id/receive` form, dashboard "Open Orders" + "Overdue Orders" cards. Activity feed gains `order-receive` rendering and `(via PO-...)` traceability suffix on stock-in rows.
-6. Attachments: `bootstrap.ts` adds `orders/` folder. `attachmentService.ts` (`ensureOrderFolder`, upload, delete, getUrl). Staged upload lifecycle in create + receive forms. Detail page renders both buckets with download links.
-7. Polish: "Cancel & Re-create" pre-fill flow on detail page; supplier autocomplete; PO# uniqueness UX.
+0a. **SharePoint-mode `InventoryContext` bootstrap** (pre-req). On provider mount in MSAL-configured mode, run `initializeDataStore()` + `readTransactionLog()` and derive `items`/`orders` from the log instead of using mocks. Migrate the existing item/stock mutator methods to delegate to `appendTransaction()` in SharePoint mode (turning callers async — the touched pages are NewItem, ItemDetail, StockForm, Import). **Delete `src/hooks/useInventoryData.ts`** (no callers, dead code). Add the production-caller assertion (`scripts/check-no-old-write-result.ts` or a CI grep) so anyone reintroducing the old return shape is caught. Mock-mode behavior unchanged. Standalone PR-shaped step.
+0b. **Retry/backoff + Zod-on-write hardening** (pre-req). Add jittered exponential backoff to `appendTransaction`'s retry loop (`MAX_RETRIES` 3 → 6, base delay 50ms × 2^attempt + random jitter). Add `parseTransactionInput()` that runs `TransactionSchema.parse(...)` before business validation. Tests for both. Lands before `appendTransactions` because it shares the loop body.
+0c. **`Dashboard.tsx` activity feed safety refactor** (pre-req for step 5). Move the `tx.data` casts inside each `case` of `renderText()` (lines 120-121); remove the unconditional `(tx.data as StockData).quantity` and `.note` reads. No behavior change for existing transaction types; unblocks safe addition of order types in step 5.
+1. `unitOfMeasure` field rolled out across model, schemas (create has `.default('each')`, update has `.optional()` with NO default), derive, mock, NewItem/ItemDetail/InventoryList (with empty-string→undefined submit shim), CSV import/export. Tests + docs. *(Touches the most files; standalone.)*
+1a. `isStub` field rolled out: add to `InventoryItem`, `ItemCreateData`, `ItemUpdateData`, schemas (update is `z.literal(false).optional()`), `deriveInventory` graduation logic, `InventoryList` "Show stubs" toggle, dashboard low-stock filter excludes stubs. Tests.
+2. Transaction model: add `order-create` / `order-receive` / `order-cancel` types + Zod schemas (with `OrderReceiveDataSchema` per-line refinements; cross-schema `receivedLines.length === order.lineItems.length` check in `validateTransaction`). Extend `validateTransaction()` signature to `(input, items, orders)` and add cases for the new types. `appendTransactions()` helper with sequential incremental staged validation (`applyTransaction` helper extracted), frozen-identity rule, idempotency rules + tests (including the perf test on 10k-tx fixture).
+3. `deriveOrders()` + `Order` types + `orderService` (create / cancel only at this stage) + `findLatestLineItemForItem` (filters non-cancelled) + tests. Defensive-ignore branches in derivers.
+4. `/orders` list, `/orders/new`, `/orders/:id` (without attachments, without receive). End-to-end flow for placed POs. Activity feed renders `order-create` / `order-cancel`. Mock orders use relative dates (`daysFromToday(n)`) if exposed in dev mode.
+5. Receive flow: `receiveOrder` in service, `/orders/:id/receive` form, dashboard "Open Orders" + "Overdue Orders" cards. Activity feed gains `order-receive` rendering and `(via PO-...)` traceability suffix on stock-in rows. Past-expiration warning + optional reason field.
+6. Attachments: `bootstrap.ts` adds `orders/` folder. `attachmentService.ts` (`ensureOrderFolder`, upload, delete, getUrl). Staged upload lifecycle in create + receive forms with name+size dedup, beforeunload+pagehide cleanup, logout cleanup. Detail page renders both buckets with download links. **`scripts/prune-order-attachments.ts`** ships in this step with README "Maintenance" docs.
+7. Polish: "Edit (cancels original on save)" button + banner on detail page; supplier autocomplete; PO# uniqueness UX (concurrent-PO# race surfaces clear error); empty-receive guard messaging.
