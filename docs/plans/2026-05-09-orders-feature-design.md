@@ -332,7 +332,7 @@ ETag conflicts (412) re-trigger the entire validate-and-stage loop with the fres
 createOrder(input: OrderCreateInput): Promise<Order>      // 1 order-create + N item-create (for quick-add)
 receiveOrder(orderId, input: OrderReceiveInput): Promise<Order>  // 1 order-receive + N stock-in (zero-qty lines skipped)
 cancelOrder(orderId, note?): Promise<Order>               // 1 order-cancel
-listOrders(): Order[]                                     // returns deriveOrders(currentTransactions)
+listOrders(): Order[]                                     // returns deriveOrders(currentKnown)
 getOrder(orderId): Order | null
 findLatestLineItemForItem(itemId): OrderLineItem | null   // for autofill
 ```
@@ -347,9 +347,9 @@ findLatestLineItemForItem(itemId): OrderLineItem | null   // for autofill
 
 ```ts
 ensureOrderFolder(orderId: string): Promise<void>
-uploadOrderAttachment(orderId: string, file: File, stage): Promise<OrderAttachment>
+uploadOrderAttachment(orderId: string, file: File, stage: 'placed' | 'received', signal?: AbortSignal): Promise<OrderAttachment>
 deleteOrderAttachment(orderId: string, filename: string): Promise<void>
-getOrderAttachmentUrl(orderId, filename): Promise<string>
+getOrderAttachmentUrl(orderId: string, filename: string): Promise<string>
 ```
 
 Mirrors `src/api/imageOperations.ts`: sanitize, prefix uuid, PUT to SharePoint, return metadata. `ensureOrderFolder` is called by the upload flow before the first PUT to a given order; subsequent uploads in the same flow skip it via a per-flow `Set`. `deleteOrderAttachment` is used for cleanup on form cancel and admin removal.
@@ -447,7 +447,7 @@ The current `src/context/InventoryContext.tsx` is mock-backed in BOTH dev and Sh
 **Fix (must land before order mutations are wired to Graph):** introduce a SharePoint-mode bootstrap in `InventoryContext`:
 
 1. On provider mount, if MSAL is configured, call `initializeDataStore()` then `readTransactionLog()`.
-2. Set `transactions` from the loaded log; derive `items` via `deriveInventory(transactions)` and `orders` via `deriveOrders(transactions)`.
+2. Set `transactions` (raw `unknown[]`) and `known` (typed `Transaction[]`) from the loaded log; derive `items` via `deriveInventory(known)` and `orders` via `deriveOrders(known)`.
 3. Mock data is used only when MSAL is NOT configured (dev mode), gated by the same `msalConfigured` boolean used in `AuthGate`.
 4. **Service return contract.** `appendTransaction()` and `appendTransactions()` are changed to return `WriteResult = { transactions: unknown[]; known: Transaction[]; items: InventoryItem[]; orders: Order[] }` instead of just `InventoryItem[]` — see "Service return type" above for why `transactions` is `unknown[]` and not `Transaction[]`. The context replaces all four from this return value. Existing call sites of `appendTransaction()` are updated (today there are none in production code paths — the function is exercised only by tests and the unwired `useInventoryData` hook, so the breaking change is contained).
 
@@ -561,7 +561,7 @@ Matches existing inventory model:
 
 ## Validation (Zod + business rules)
 
-- `poNumber`: `z.string().trim().regex(/^[A-Za-z0-9-]{1,32}$/, 'PO# must be 1-32 ASCII alphanumerics or dashes')`, **unique across non-cancelled orders** (checked at save against `deriveOrders(transactions)`). The regex blocks emoji, RTL marks, mixed-script confusables (Cyrillic `О` vs Latin `O`), and stray whitespace that would let two visually-identical POs both pass uniqueness. PO numbers from cancelled orders are released and may be reused — this enables the v1 "edit = cancel + recreate" workflow without forcing the user to mint a new number. Suppliers' free-form PO strings must be normalized at entry (UI shows live regex-fail feedback).
+- `poNumber`: `z.string().trim().regex(/^[A-Za-z0-9-]{1,32}$/, 'PO# must be 1-32 ASCII alphanumerics or dashes')`, **unique across non-cancelled orders** (checked at save against `deriveOrders(known)`). The regex blocks emoji, RTL marks, mixed-script confusables (Cyrillic `О` vs Latin `O`), and stray whitespace that would let two visually-identical POs both pass uniqueness. PO numbers from cancelled orders are released and may be reused — this enables the v1 "edit = cancel + recreate" workflow without forcing the user to mint a new number. Suppliers' free-form PO strings must be normalized at entry (UI shows live regex-fail feedback).
 - `orderConfirmationNumber`: required, non-empty.
 - `supplier`: required.
 - At least one line item required.
