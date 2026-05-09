@@ -32,6 +32,8 @@ export const msalInstance = new PublicClientApplication(msalConfig);
 
 `AuthGate.tsx` imports `msalInstance` from this module (instead of constructing one locally), and its `useEffect` does `await msalInstance.initialize()` plus `handleRedirectPromise()` exactly as today. `transactionService.ts:14` keeps importing `msalInstance` but from the new path.
 
+**Event-callback cleanup.** Today `AuthGate.tsx:60-72` calls `addEventCallback(...)` but never `removeEventCallback`. With React StrictMode in dev (which double-mounts effects), each remount registers another callback — they pile up. The refactored effect captures the return value of `addEventCallback(id)` and calls `msalInstance.removeEventCallback(id)` in the cleanup function. Production behavior is unchanged (one callback registered); dev/test no longer leak.
+
 The earlier "either approach" wording was wrong: dropping `AuthGate` would lose its login-state UX and the unmount-safety wiring. There is one canonical fix; the alternative would ship a broken UI. Listed as Step 0 in the implementation order.
 
 ## Forward-compat: stale clients + rollback
@@ -61,6 +63,14 @@ Old bundles continue to read inventory normally; orders simply don't exist in th
 The existing app is event-sourced: `transactions.json` is the SOLE source of truth, and `deriveInventory(transactions)` rebuilds inventory state by replaying the log (`src/utils/deriveState.ts:52`). There is NO `inventory.json`. Orders follow the same model:
 
 - **Orders are derived state.** A new `deriveOrders(transactions)` function replays `order-*` transactions and returns the current `Order[]`. No separate `orders.json` file. Cross-file atomicity is therefore not a concern.
+- **`Order.attachments` derivation rule.** Naive concatenation in event order:
+  ```
+  Order.attachments = [
+    ...orderCreate.data.attachments,    // each tagged stage: 'placed'
+    ...orderReceive?.data.attachments,  // each tagged stage: 'received', if a receive event exists
+  ]
+  ```
+  No de-duplication: each `OrderAttachment.id` is uuid'd, so even if a user uploads the same physical file at both stages it shows as two separate entries with different stages and ids. A future cancel event does NOT remove attachments. Test fixture: a sequence with attachments on both create and receive verifies both bucket sections render correctly on the detail page.
 - **Three new transaction types** added to the existing discriminated union: `order-create`, `order-receive`, `order-cancel`.
 - **Multi-event writes** (e.g. receive emits 1 `order-receive` + N `stock-in`) require a new `appendTransactions(inputs[])` helper that commits all of them in a single ETag cycle. Without this, partial network failure could leave inconsistent state.
 
@@ -119,7 +129,7 @@ These join the existing `TransactionSchema` discriminated union in `src/models/s
 | `name` | string | snapshot at order time |
 | `unitOfMeasure` | string | `'each' \| 'box' \| 'kit' \| 'case'` or custom |
 | `quantityOrdered` | number | `> 0` |
-| `quantityReceived` | number \| null | set on receive; `0` allowed (no stock-in emitted) |
+| `quantityReceived` | number \| null | derivation: `null` iff order status is `placed`/`cancelled`; explicit `number` (including `0` for zero-receive lines) iff status is `received`. Detail page distinguishes "0 of 10 received" from "— of 10 (not yet received)". |
 | `unitCost` | number | `>= 0` |
 | `lotNumber` | string \| null | required iff `quantityReceived > 0` |
 | `expirationDate` | ISO date \| null | required iff `quantityReceived > 0` |
@@ -178,6 +188,26 @@ export function getOrderFilePath(orderId: string, filename: string): string {
 
 ## API additions
 
+### `writeTransactionLog` — upload-session fallback for >4 MB bodies
+
+Microsoft Graph's simple PUT (`/items/{id}/content`) caps the request body at 4 MB. At ~500 bytes/transaction, that ceiling is hit around 8,000 transactions. A 5-user / 5-year deployment with this feature crosses it (1,250 orders × 5 receive lines = ~6,250 stock-in events on top of base traffic, easily ≥10k total). The bug is dormant today and surfaces silently 1-2 years out — at which point every mutation fails atomically with `413 Request Entity Too Large`.
+
+**Fix (lands in step 0b):** `writeTransactionLog` switches to an upload session when `Buffer.byteLength(body) > 4_000_000`:
+
+```ts
+const body = JSON.stringify(data, null, 2);
+if (body.length <= 4_000_000) {
+  return simpleput(url, body, eTag);   // existing path
+}
+// Upload session: POST /items/{id}/createUploadSession, then PUT chunks to the
+// returned uploadUrl with Content-Range headers; the final chunk's response
+// carries the new eTag. The session URL is unauthenticated (issued pre-signed),
+// matching the existing two-step read pattern.
+return uploadSessionPut(url, body, eTag);
+```
+
+The threshold is a literal 4_000_000 (not 4_194_304 = 4 × 1024²) per Graph docs. The session approach supports up to ~60 MB without further work, which buys the deployment another ~10 years at current growth. Compaction (snapshot + truncate-old-events) is the v2 follow-up if this ever becomes a real ceiling. Added to the test list.
+
 ### Service return type
 
 Both `appendTransaction()` (existing, `src/api/transactionService.ts:36`) and the new `appendTransactions()` are changed to return:
@@ -207,7 +237,14 @@ const BASE_DELAY  = 50;                // ms
 await sleep(BASE_DELAY * 2 ** attempt + Math.random() * BASE_DELAY);
 ```
 
-This is jittered exponential backoff (50, ~110, ~250, ~550, ~1150, ~2350 ms). Without backoff the existing `while (retries <= MAX_RETRIES)` (`transactionService.ts:41-79`) ping-pongs through ETag conflicts in <100 ms under contention and exhausts retries before any natural staggering can resolve them. The cap of 6 attempts puts the worst-case wall time at ~5 seconds, surfaced to the user as a transient conflict error with a "Try again" button. `appendTransaction()` (single-input) gets the same backoff treatment — it's a strict win.
+This is jittered exponential backoff (50, ~110, ~250, ~550, ~1150, ~2350 ms). Without backoff the existing `while (retries <= MAX_RETRIES)` (`transactionService.ts:41-79`) ping-pongs through ETag conflicts in <100 ms under contention and exhausts retries before any natural staggering can resolve them. The cap of 6 attempts puts the worst-case wall time at ~5 seconds. `appendTransaction()` (single-input) gets the same backoff treatment — it's a strict win.
+
+**Save-flow UX during retry.** A 5-second wall time looks like a frozen UI without explicit affordances. The Save handler in every form using `appendTransaction(s)`:
+
+- Disables the Save button as soon as it's clicked.
+- Replaces the button label with a spinner + "Saving..." (no per-attempt count — that's noisy).
+- Threads an `AbortSignal` into `appendTransaction(s)`; the retry loop checks `signal.aborted` between sleeps and bails out cleanly. Cancel-during-retry triggers `controller.abort()`, which propagates to in-flight `graphFetch` and runs the attachment-cleanup path.
+- On exhaustion, surfaces a "Try again" toast + re-enables the Save button (form state preserved, identity-frozen IDs preserved so the retry is idempotent).
 
 **Sequential staged validation, incremental, Map-based.** Intra-batch dependencies must be enforced (e.g., a quick-add `item-create` must be visible to the subsequent `order-create`'s line-item check). Naive `deriveInventory(stagedLog)` per input is O(N²) on the full log; for a 50-line receive against a 5,000-tx log that's ~250k replay-steps × retries — browser-jank territory.
 
@@ -250,11 +287,17 @@ A perf test exercises M=50, N=5,000, T=10,000 and asserts <100 ms total validati
 | `order-receive` | none directly (the batch's own `stock-in` rows handle item validation) | `orders.find(o => o.id === input.itemId && o.status === 'placed')`; receivedLines line-id-set === order.lineItems id-set | the cross-schema length/id-set check |
 | `order-cancel` | none | `orders.find(o => o.id === input.itemId && o.status === 'placed')` | nothing else; `replacedBy` is informational (see schema note below) |
 
-Existing item/stock cases are unchanged.
+**Existing item/stock cases gain ONE new check:**
+
+| Case | New rule |
+|---|---|
+| `item-delete` | Reject (`ItemReferencedByOrderError`) if any non-cancelled order has `lineItems[i].itemId === input.itemId`. Prevents deleting an item that's on an open PO — without this, the receive flow would later throw `ItemNotFoundError` with no UI guidance. The cancel flow on the referencing order is the user's escape hatch. |
+
+`item-create`, `item-update`, `stock-in`, `stock-out` cases are otherwise unchanged.
 
 **Idempotency rules** (precise):
 
-- **Pre-input duplicate-id check.** If two inputs in the batch share an `id`, throw `DuplicateInputIdError` immediately (programmer error).
+- **Pre-input duplicate-id check.** If two inputs in the batch share an `id`, throw `DuplicateInputIdError` immediately (programmer error). Additional check for order events: if two `order-*` inputs share the same `itemId` (which is the order UUID for those types), throw `DuplicateOrderIdError` — catches the bug shape "`cancelAndRecreate` accidentally pointed both the cancel and the recreate at the predecessor's order id." (The `id` check above does NOT catch this because `tx.id` is unique per tx, but `itemId` would be reused.)
 - **Full-match no-op.** If ALL input IDs already exist in the persisted log AND the persisted transactions match the inputs (same `type`, `itemId`, `data`), return the current derived state without writing — this is the idempotent retry path. Relies on the frozen-identity rule above.
 - **Partial overlap.** If a STRICT SUBSET of input IDs exist in the log, throw `BatchPartiallyCommittedError`. Caller decides whether to surface as a conflict or retry with new IDs.
 - **Mismatched id reuse.** If an input ID exists in the log but with different `type`/`itemId`/`data`, throw `IdReuseError`.
@@ -336,12 +379,12 @@ Receive is single-event: one click closes the PO. No partial-receive-across-mult
 The naive approach — uploading on file drop, before the order is saved — leaks files when the user cancels or validation fails. Instead, files transition through three states: **staged → uploaded → committed**. Cleanup is required at every transition where a file is abandoned.
 
 1. **Staged (in memory).** When the user adds a file, keep the `File` object in component state. Show in the UI as a chip with name, size, ✕ remove. No SharePoint call yet. **De-duplication:** before adding a new staged file, check the existing staged + uploaded lists for an entry with the same `name` AND `size` (cheap heuristic, no hashing). If a match is found, prompt: *"This looks like the same file you already added. Replace, keep both, or skip?"* — default to "Skip". Avoids accidental double-uploads when users drag a file twice.
-2. **Upload phase (on Save click).** Generate `orderId` upfront so paths are stable. Sequentially upload all staged files via `uploadOrderAttachment(orderId, file, stage)`, calling `ensureOrderFolder(orderId)` once before the first upload. As each completes, move it to an `uploadedAttachments` list in component state. On per-file upload failure: show inline error, leave already-uploaded files in the uploaded list, let the user retry/remove the failed file. The order transaction is NOT committed yet.
+2. **Upload phase (on Save click).** Generate `orderId` upfront so paths are stable. Sequentially upload all staged files via `uploadOrderAttachment(orderId, file, stage, abortSignal)`, calling `ensureOrderFolder(orderId)` once before the first upload. **Each in-flight upload registers in `pendingUploads: Set<{ filename, abortController }>`** so unmount/cancel can `abort()` the network call before it commits server-side. As each completes successfully, the entry moves from `pendingUploads` to `uploadedAttachments` in component state. On per-file upload failure: show inline error, leave already-uploaded files in the uploaded list, let the user retry/remove the failed file. The order transaction is NOT committed yet.
 3. **Commit phase.** Once all files are in `uploadedAttachments`, call `appendTransactions(...)` with the order transaction(s) that reference those filenames.
 4. **Cleanup triggers** — any of these abandons the in-flight upload state and must DELETE the `uploadedAttachments` files (best-effort, fire-and-forget):
    - **User clicks Cancel** on the form.
    - **Commit fails** (`appendTransactions` throws after exhausting retries). The user is shown the error with two buttons: "Retry" (re-attempts commit using the same uploaded files) and "Discard" (cleanup + close form). On unmount-before-decision, default to Discard.
-   - **Component unmount or navigation away** without an explicit Cancel/Retry decision — `useEffect` cleanup fires DELETE for `uploadedAttachments`.
+   - **Component unmount or navigation away** without an explicit Cancel/Retry decision — `useEffect` cleanup runs in two phases: (a) `abort()` every `pendingUploads` entry's controller (cancels in-flight PUTs that haven't yet committed server-side; with `keepalive: true` semantics on the PUT some may still complete, but the abort closes the local stream early), then (b) DELETE every `uploadedAttachments` entry. Files that complete server-side after abort are caught by the next admin prune run.
    - **Tab close / page refresh** — best-effort and explicitly NOT relied on. Implementation: a `beforeunload` AND `pagehide` listener (the latter for Safari/iOS) fires `fetch(graphDeleteUrl, { method: 'DELETE', headers: { Authorization: 'Bearer ' + cachedToken }, keepalive: true })` for each `uploadedAttachments` entry — but ONLY if a non-expired access token is already in MSAL's in-memory cache (checked via `acquireTokenSilent` with a synchronous-only fast path; if that would require iframe/popup/redirect, we skip). MSAL has no public sync API for "is there a token without I/O", so the implementation tries `acquireTokenSilent({ forceRefresh: false })` synchronously and treats any awaited promise resolution after the unload as a no-op. The `keepalive` flag has a 64 KB body cap which is not a concern for DELETE. **Tab close cleanup is documented as a courtesy, not a guarantee.**
    - **Logout** — register a cleanup handler on MSAL's `LOGOUT_START` event (NOT `LOGOUT_SUCCESS`, which fires after the cache is wiped). The handler synchronously fires DELETE for `uploadedAttachments` using the still-valid token; logout proceeds in parallel. If logout completes before all DELETEs return, the in-flight requests continue under their already-attached bearer header until network drains. Pure best-effort; if a DELETE 404s (because tab-close cleanup already ran, see "Logout → unmount race" below), it's swallowed. Admin pruning catches anything that escapes.
 
@@ -392,6 +435,8 @@ findLatestLineItemForItem(itemId): OrderLineItem | null;
 
 **`useInventoryData` removal.** `src/hooks/useInventoryData.ts` exists but has no callers (verified via grep against the worktree). The new bootstrap subsumes its responsibility. We DELETE the hook in step 0a rather than "leave it alone" — keeping it creates dead code that looks reachable to a future reader and could drift out of sync with the bootstrap. Tests covering the hook (if any) are deleted with it.
 
+**Memoization.** `deriveInventory(transactions)` and `deriveOrders(transactions)` are O(T) on the full log; running them on every render of every consumer would be wasteful as the log grows. Both are wrapped in `useMemo(() => deriveInventory(transactions), [transactions])` (and the orders equivalent) inside the context provider. The `transactions` array reference changes only when an append commits, so memoization is stable. Same for `deriveInventoryMap` / `deriveOrdersMap` if exposed to consumers.
+
 ### `/orders` — list
 Table: PO#, supplier, order date, expected delivery, status badge, line count, total $. Filters: status, supplier, date range. Search: PO# or confirmation#. "+ New Order" top-right.
 
@@ -406,7 +451,7 @@ Editable received qty / lot / expiration per line; receive docs upload; Confirm.
 
 ### Dashboard additions
 - **Open Orders** card — count of `placed` POs, links to filtered list.
-- **Overdue Orders** callout — `placed` POs whose `expectedDeliveryDate` < today. **Mock data note:** if the orders feature is exposed in dev mode, `src/mock/data.ts` mock orders compute `expectedDeliveryDate` as `today + N days` at module load (using a small helper `daysFromToday(n)`), NOT hardcoded ISO strings. Hardcoded mock dates will become "overdue" the day after a commit and pollute the dashboard for every dev who pulls.
+- **Overdue Orders** callout — `placed` POs whose `expectedDeliveryDate` < today. **Mock data note:** if the orders feature is exposed in dev mode, `src/mock/data.ts` mock orders compute `expectedDeliveryDate` as `today + N days` at module load (using a small helper `daysFromToday(n)`), NOT hardcoded ISO strings. Hardcoded mock dates will become "overdue" the day after a commit and pollute the dashboard for every dev who pulls. **`daysFromToday(n)` returns `YYYY-MM-DD`** (date only, no time component) — full ISO timestamps make the function timezone-flaky (a value computed at 23:59 UTC-7 differs from one computed at 00:01 the next morning).
 
 ### Activity feed updates (`src/pages/Dashboard.tsx`)
 The current activity feed at `src/pages/Dashboard.tsx:101` only renders item/stock transaction types and falls through to a no-render default for unknown types. Order events would otherwise appear blank. Three updates:
@@ -429,7 +474,7 @@ Matches existing inventory model:
 
 ## Validation (Zod + business rules)
 
-- `poNumber`: non-empty, trimmed, **unique across non-cancelled orders** (checked at save against `deriveOrders(transactions)`). PO numbers from cancelled orders are released and may be reused — this enables the v1 "edit = cancel + recreate" workflow without forcing the user to mint a new number.
+- `poNumber`: `z.string().trim().regex(/^[A-Za-z0-9-]{1,32}$/, 'PO# must be 1-32 ASCII alphanumerics or dashes')`, **unique across non-cancelled orders** (checked at save against `deriveOrders(transactions)`). The regex blocks emoji, RTL marks, mixed-script confusables (Cyrillic `О` vs Latin `O`), and stray whitespace that would let two visually-identical POs both pass uniqueness. PO numbers from cancelled orders are released and may be reused — this enables the v1 "edit = cancel + recreate" workflow without forcing the user to mint a new number. Suppliers' free-form PO strings must be normalized at entry (UI shows live regex-fail feedback).
 - `orderConfirmationNumber`: required, non-empty.
 - `supplier`: required.
 - At least one line item required.
@@ -457,6 +502,7 @@ Matches existing inventory model:
 - **Attachment upload failure mid-save:** see "Attachment lifecycle" — staged files retried independently; order commit happens only after upload phase resolves.
 - **Cancelled order with attachments:** files stay on SharePoint and remain accessible from the detail page.
 - **Empty order folder when all attachments are removed before commit:** if a user adds attachments, uploads them, then removes them all (each cleanup deletes the file), the per-order folder created by `ensureOrderFolder()` may be left empty. The pruning script (`scripts/prune-order-attachments.ts`) handles this — empty folders for unknown order IDs are removed in the same pass. Not blocking; folders are cheap.
+- **Refresh mid-save creates duplicate stub items.** If the user submits an order with quick-add stubs and the network drops between server-processing and client-receiving the 200, the user might refresh the page before the retry-with-frozen-identity completes. On the next save attempt, fresh UUIDs/SKUs are minted (frozen-identity is per-batch, not per-logical-flow). PO# uniqueness blocks the duplicate ORDER, but the stub `item-create` events from the first attempt are already in the log AND the second attempt also writes its own stubs. Net result: 2× stubs for the same intended item. Cleanup is via the "Show stubs" toggle + manual delete. **Acceptable in v1**; documented here so users debugging "why are there two of this stub" know the cause. A v2 fix would require a session-stable identity token persisted in localStorage that survives refresh.
 
 ## Testing (Vitest, follows existing patterns under `src/**/__tests__/`)
 
@@ -464,7 +510,7 @@ Matches existing inventory model:
 - **`validateTransaction` case-table tests:** explicit assertions for each order type — `order-create` does NOT call `validateItemExists(input.itemId, items)` (would throw); `order-receive` rejects with target order in `received` or `cancelled` state; `order-cancel` rejects with target in `cancelled` state.
 - `deriveOrders.test.ts`: replay sequences produce expected order state for create / receive / cancel. Out-of-order or duplicate events are tolerated (idempotency). Defensive ignore: `item-*` referencing an order's UUID is logged and skipped; `order-*` referencing an unknown id same.
 - `deriveState.test.ts` invariant test: order ID set ∩ item ID set = ∅ on a representative log; intentional collision fixture verifies defensive-ignore path.
-- `appendTransactions.test.ts`: atomic batch write; 412-retry with backoff (mock the sleep); sequential staged validation (intra-batch dependencies enforced); incremental `applyTransaction` matches `deriveInventory(stagedLog)` on a 100-event fixture; perf test asserts <100ms validation on 50-line receive against a 10k-tx log; idempotency cases — full-match no-op, partial-overlap throws `BatchPartiallyCommittedError`, intra-batch duplicate id throws `DuplicateInputIdError`, mismatched-id-reuse throws `IdReuseError`; **identity-frozen test** — simulate 412 conflict, assert all `id` and `sku` values in retry attempt match the first attempt; **Zod parse on write** — TS-typed but Zod-invalid input is rejected before write (e.g. malformed UUID, extra unknown key); **Cancel & Re-create race** — a concurrent placement of the same PO# between read and write fails the recreate's batch and surfaces a clear error.
+- `appendTransactions.test.ts`: atomic batch write; 412-retry with backoff (mock the sleep); sequential staged validation (intra-batch dependencies enforced); incremental `applyTransaction` matches `deriveInventory(stagedLog)` on a 100-event fixture; perf test asserts <100ms validation on 50-line receive against a 10k-tx log generated at test setup via a deterministic seeded helper `generatePerfFixture(N=10000)` (NOT committed as a JSON fixture — keeps repo lean); idempotency cases — full-match no-op, partial-overlap throws `BatchPartiallyCommittedError`, intra-batch duplicate id throws `DuplicateInputIdError`, dup-itemId-on-order-events throws `DuplicateOrderIdError`, mismatched-id-reuse throws `IdReuseError`; **identity-frozen test** — simulate 412 conflict, assert all `id` and `sku` values in retry attempt match the first attempt; **Zod parse on write** — TS-typed but Zod-invalid input is rejected before write (e.g. malformed UUID, extra unknown key); **Cancel & Re-create race** — a concurrent placement of the same PO# between read and write fails the recreate's batch and surfaces a clear error; **AbortSignal** — cancel-during-retry aborts in-flight `graphFetch` and triggers attachment cleanup; **upload-session fallback** — `writeTransactionLog` with body >4MB switches to upload session, returns the new eTag.
 - `orderService.test.ts`: create (with and without quick-add items), receive (full / short / zero / over per line), cancel. Verify `stock-in` emissions match non-zero received lines and that batches land on correct items via `deriveInventory`. **Cancel & Re-create batch ordering:** `orderService.cancelAndRecreate(...)` always emits `[itemCreates..., orderCancel(predecessor), orderCreate(replacement)]` in that order; reversing order would fail PO#-uniqueness; helper hard-codes the order. `replacedBy` and `note: "Replaced by PO-..."` populated on the cancel transaction.
 - **Cancel & Re-create vs Receive race:** fixture where two batches target the same order; assert the loser surfaces a clear status-mismatch error after retry.
 - **Stub graduation monotonicity:** fixture `item-create(stub) → stock-in → stock-out-to-zero` produces final state `isStub: false`; fixture `item-create(stub) → item-update(isStub:false) → no further updates` stays `isStub: false`.
@@ -503,7 +549,13 @@ Matches existing inventory model:
 
    The order within this step is: change return shape → migrate callers → delete hook → add CI gate. Without bundling, the CI gate would self-fail mid-step. PR is medium-sized.
 
-0a-2. **Forward-compat schema tolerance** (pre-req). Change `TransactionLogSchema` to use `z.array(z.unknown())` at the top level and per-element `safeParse` against the union, dropping unknown types with a console warning rather than throwing `DataLossError`. Add `schemaVersion: z.literal(2).optional()` to `TransactionLog` (writers always set it; readers ignore unknown values). Must land before step 2 commits any `order-*` transaction; otherwise a stale tab loading the new log dies. Tests cover both directions of compat.
+0a-2. **Forward-compat schema tolerance** (pre-req). Two changes that travel together:
+
+   a. **Top-level log:** change `TransactionLogSchema` to use `z.array(z.unknown())` at the top level and per-element `safeParse` against the union, dropping unknown types with a console warning rather than throwing `DataLossError`. Add `schemaVersion: z.literal(2).optional()` to `TransactionLog` (writers always set it; readers ignore unknown values).
+
+   b. **Per-payload tolerance:** drop `.strict()` from `ItemCreateDataSchema`, `ItemUpdateDataSchema`, `ItemDeleteDataSchema`, `StockDataSchema` (and use the Zod default — unknown keys are silently allowed). Reason: when step 1 lands `unitOfMeasure` and step 1a lands `isStub`, a stale tab with the old strict schemas reads a new log and the per-tx `safeParse` from (a) above fails on the unknown field, dropping the entire `item-create` from in-memory state — the user sees items vanish. Discriminated-union type safety is enforced by the `type` field; field-level strictness on the data payloads is over-tight. Type-safety regression risk is bounded because the TS types still constrain what callers WRITE; only the read path becomes lenient.
+
+   Both must land before step 1 commits any new field; otherwise the rollout itself breaks stale tabs. Tests cover both directions of compat (old schema reads new log; new schema reads old log).
 
 0b. **Retry/backoff + Zod-on-write hardening** (pre-req). Add jittered exponential backoff to `appendTransaction`'s retry loop (`MAX_RETRIES` 3 → 6, base delay 50ms × 2^attempt + random jitter). **Note:** existing item/stock mutations (now async per step 0a) will see worst-case wall time grow from ~150ms to ~5s in the rare contention case; surface as a "Try again" toast rather than a thrown error. Add `parseTransactionInput()` that runs `TransactionSchema.parse(...)` before business validation. Tests for both. Lands before `appendTransactions` because it shares the loop body.
 
