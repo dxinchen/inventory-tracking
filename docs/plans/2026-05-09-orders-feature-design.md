@@ -48,7 +48,7 @@ export const TransactionLogSchema = z.object({
   schemaVersion: z.literal(2).optional(),  // present iff written by new code
   transactions: z.array(z.unknown()),       // shallow at this layer
 });
-// Per-transaction parse uses TransactionSchema.safeParse(...) on each element;
+// Per-transaction parse uses TransactionReadSchema.safeParse(...) on each element;
 // failures are logged and the element is dropped from the in-memory log
 // (so an old bundle reading new entries shows current inventory MINUS orders
 // rather than crashing).
@@ -112,7 +112,7 @@ Three new data payload schemas (Zod):
 - `OrderReceiveDataSchema` — `receivedLines[]` (line id, quantityReceived, lotNumber?, expirationDate?) + `attachments[]` (receive docs) + `actualReceiveDate`. Per-line Zod refinements: `quantityReceived` is a non-negative integer; `lotNumber` non-empty AND `expirationDate` parseable IFF `quantityReceived > 0`. **Cross-schema check** (cannot live purely in Zod since it needs the target order's `lineItems`): in `validateTransaction()` for `order-receive`, assert `receivedLines.length === order.lineItems.length` AND `receivedLines.map(r => r.id).sort() ≡ order.lineItems.map(l => l.id).sort()`. An empty `receivedLines` array is rejected with a `ReceiveCoverageError` — submitting "receive nothing" is forbidden; users must use Cancel for that.
 - `OrderCancelDataSchema` — `note?: z.string().optional()`, `replacedBy?: z.string().uuid().optional()`. **`replacedBy` is informational only** — it carries the replacement order's pre-rolled UUID for audit, no business-rule validation. Specifically: `validateTransaction` MUST NOT verify that `replacedBy` resolves to an existing order id, because the staged loop processes the cancel BEFORE the replacement order-create (see "Cancel & Re-create batch ordering" in Edge cases). A future implementer adding paranoid existence-check would break the flow.
 
-These join the existing `TransactionSchema` discriminated union in `src/models/schemas.ts`.
+These join the existing transaction discriminated union in `src/models/schemas.ts` (the `TransactionReadSchema` / `TransactionWriteSchema` split per step 0a-2).
 
 ### `Order` (derived, not persisted)
 
@@ -281,8 +281,9 @@ export function deriveOrdersMap   (txs: Transaction[]): Map<string, Order>      
 `appendTransactions` keeps the working state as Maps, applies each input via a pure `applyTransaction(input, itemsMap, ordersMap)` that mutates a CLONE of the map (or returns a new one) in O(1) per input, and converts to arrays only when handing off to `validateTransaction` (which needs arrays for the existing item-validators) and to the final `WriteResult`.
 
 ```ts
-let itemsMap  = deriveInventoryMap(log.transactions);
-let ordersMap = deriveOrdersMap   (log.transactions);
+// Given const log = await readTransactionLog(); — log.data is { transactions: unknown[], schemaVersion? }, log.known is Transaction[].
+let itemsMap  = deriveInventoryMap(log.known);   // typed entries only
+let ordersMap = deriveOrdersMap   (log.known);
 
 for (const input of inputs) {
   parseTransactionInput(input);                                   // Zod parse — see below
@@ -298,7 +299,7 @@ The `Array.from(map.values())` call inside the loop is O(N) on items, so the ove
 
 A perf test exercises M=50, N=5,000, T=10,000 and asserts <100 ms total validation time. If the per-validator array allocation is itself the bottleneck, we'll switch the validator signature to accept maps too — flagged as a follow-up if the perf test fails.
 
-**Input parsing — defense in depth.** `parseTransactionInput(input)` runs `TransactionSchema.parse(...)` (with synthetic `performedBy` / `timestamp` if not yet stamped) before business-rule validation. Today the existing `appendTransaction()` only validates business rules — Zod parsing happens at READ time (`fileOperations.ts:38`). A buggy `orderService` could write a TS-typed but Zod-invalid payload that then fails parse on the next read for everyone. Parsing on write closes that gap. Add to test list.
+**Input parsing — defense in depth.** `parseTransactionInput(input)` runs `TransactionWriteSchema.parse(...)` (the strict variant from step 0a-2; with synthetic `performedBy` / `timestamp` if not yet stamped) before business-rule validation. Today the existing `appendTransaction()` only validates business rules — Zod parsing happens at READ time (`fileOperations.ts:38`). A buggy `orderService` could write a TS-typed but Zod-invalid payload that then fails parse on the next read for everyone. Parsing on write closes that gap. Add to test list.
 
 `validateTransaction()` (`src/api/transactionService.ts:87`) signature is extended to accept `(input, items, orders)`. The existing switch is case-exhaustive over the 5 old types and has no `default` arm — adding the three order types follows the same pattern. **Critically: order-type cases must NOT call `validateItemExists(input.itemId, items)`**, because for `order-*` events `input.itemId` is the ORDER's UUID, not an item's. A naive copy-paste of the existing item-cases would throw `ItemNotFoundError` on every order. Per-case rules:
 
@@ -610,7 +611,7 @@ Matches existing inventory model:
 - `findLatestLineItemForItem.test.ts`: returns the most recent line from a non-cancelled order; returns null if all matching orders are cancelled; returns null with no prior orders.
 - `validation.test.ts`: receive validation (lot/exp required gating on received qty); empty `receivedLines` rejected; past expiration warning + optional reason field.
 - `unitOfMeasure` migration: replaying old `item-create` transactions defaults to `'each'`; replaying old `item-update` transactions does NOT inject `unitOfMeasure` (preserves the previously-set value); new transactions persist user-selected value; CSV import treats column as optional. **`ItemDetail` form test:** submit with `unitOfMeasure: ''` — handler converts to `undefined` before submit, schema accepts.
-- `Dashboard.test.tsx`: order events render correct text; cast-inside-case refactor — replaying a fixture with mixed transaction types does not throw on the unconditional-read removed at line 120-121; `isStub` items hidden by default with toggle to show them.
+- `Dashboard.test.tsx`: order events render correct text; cast-inside-case refactor — replaying a fixture with mixed transaction types does not throw on the unconditional-read removed at line 120-121; `isStub` items excluded from low-stock alert (the toggle lives on `/inventory`, not the dashboard).
 - Attachment validation: rejects oversized, disallowed ext, mismatched MIME; de-duplicates on `name + size`.
 - Attachment cleanup: on commit-failure path, uploaded files are DELETEd (best-effort); on user Cancel, uploaded files are DELETEd; on form unmount without explicit decision, cleanup fires; **logout fires DELETE on `LOGOUT_START`** (NOT `LOGOUT_SUCCESS`) so token is still valid; tab-close best-effort attempt is documented and tested with a mocked `pagehide`/`beforeunload` listener (assertion: cleanup is queued, not awaited). **Idempotent cleanup:** when logout-cleanup and unmount-cleanup race on the same files, second-runner's DELETE returns 404; helper swallows 404 and test asserts no error surface.
 - Bootstrap: `/orders/` folder creation tolerates 409/412; `ensureOrderFolder` is idempotent across repeated calls in one flow.
@@ -633,7 +634,7 @@ Matches existing inventory model:
 0. **Unify MSAL** (pre-req). Refactor so a single `PublicClientApplication` is initialized once (in the new `src/auth/msalInstance.ts` module) and reused by both `AuthGate.tsx` and `transactionService.ts`. Delete `AuthProvider.tsx`. **Update test mocks** — `src/api/__tests__/transactionService.test.ts:4`, `src/api/__tests__/bootstrap.test.ts:4`, and `src/api/__tests__/fileOperations.test.ts:4` all currently `vi.mock('../../auth/AuthProvider', ...)`; replace with `vi.mock('../../auth/msalInstance', ...)`. Without this update, `npm test` fails at module-resolution time the moment `AuthProvider.tsx` is deleted. Smoke test: `appendTransaction` works end-to-end against SharePoint when MSAL is configured.
 
 0a. **SharePoint-mode `InventoryContext` bootstrap + WriteResult contract change** (pre-req). Bundled because each part creates production dependencies on the others:
-   - Change `appendTransaction()` return shape from `Promise<InventoryItem[]>` to `Promise<{ transactions, items, orders }>` (the `orders` field is `[]` from a stub `deriveOrders()` placeholder until step 3 lands the real implementation).
+   - Change `appendTransaction()` return shape from `Promise<InventoryItem[]>` to `Promise<WriteResult>` where `WriteResult = { transactions: unknown[]; known: Transaction[]; items: InventoryItem[]; orders: Order[] }` — the canonical 4-field shape. The `orders` field is `[]` from a stub `deriveOrders()` placeholder until step 3 lands the real implementation. The `known` field arrives wired to the new `readTransactionLog()` return shape that step 0a-2 introduces; until 0a-2 lands `known` simply mirrors `transactions` cast to `Transaction[]` (no unknown entries exist yet because no stale-bundle scenario has occurred). Tests assert against the full 4-field shape from this step onward — no follow-up rewrite needed when 0a-2 lands.
    - **Update existing test assertions:** `src/api/__tests__/transactionService.test.ts:36-61` ("appendTransaction (design contract)") asserts against the OLD `Promise<InventoryItem[]>` return shape — rewrite to assert the new `WriteResult`. Same file's "TransactionInput shape" tests at line 25 reference comments tied to the old contract; update phrasing.
    - On provider mount in MSAL-configured mode, run `initializeDataStore()` + `readTransactionLog()` and derive `items`/`orders` from the log instead of using mocks.
    - Migrate the existing item/stock mutator methods to delegate to `appendTransaction()` in SharePoint mode (turning callers async — the touched pages are NewItem, ItemDetail, StockForm, Import). Callers consume the new `WriteResult` shape directly.
@@ -689,7 +690,7 @@ Matches existing inventory model:
 
    Both (a) and (b) must land before step 1 commits any new field; otherwise the rollout itself breaks stale tabs. Tests: (i) write-path strictness still rejects a payload with `quantity` in it (regression guard); (ii) read-path tolerance accepts a payload with unknown extra fields and exposes them on the parsed object.
 
-0b. **Retry/backoff + Zod-on-write hardening** (pre-req). Add jittered exponential backoff to `appendTransaction`'s retry loop (`MAX_RETRIES` 3 → 6, base delay 50ms × 2^attempt + random jitter). **Note:** existing item/stock mutations (now async per step 0a) will see worst-case wall time grow from ~150ms to ~5s in the rare contention case; surface as a "Try again" toast rather than a thrown error. Add `parseTransactionInput()` that runs `TransactionSchema.parse(...)` before business validation. Tests for both. Lands before `appendTransactions` because it shares the loop body.
+0b. **Retry/backoff + Zod-on-write hardening** (pre-req). Add jittered exponential backoff to `appendTransaction`'s retry loop (`MAX_RETRIES` 3 → 6, base delay 50ms × 2^attempt + random jitter). **Note:** existing item/stock mutations (now async per step 0a) will see worst-case wall time grow from ~150ms to ~5s in the rare contention case; surface as a "Try again" toast rather than a thrown error. Add `parseTransactionInput()` that runs `TransactionWriteSchema.parse(...)` (the strict variant from step 0a-2) before business validation. Tests for both. Lands before `appendTransactions` because it shares the loop body. **Also lands the `writeTransactionLog` upload-session fallback** for bodies > 4MB documented in the API additions section.
 
 0c. **`Dashboard.tsx` activity feed safety refactor** (pre-req for step 5). Move the `tx.data` casts inside each `case` of `renderText()` (lines 120-121); remove the unconditional `(tx.data as StockData).quantity` and `.note` reads. No behavior change for existing transaction types; unblocks safe addition of order types in step 5.
 1. `unitOfMeasure` field rolled out across model, schemas (create has `.default('each')`, update has `.optional()` with NO default), derive, mock, NewItem/ItemDetail/InventoryList (with empty-string→undefined submit shim), CSV import/export. Tests + docs. *(Touches the most files; standalone.)*
