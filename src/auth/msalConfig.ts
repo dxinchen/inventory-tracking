@@ -8,6 +8,8 @@ if (!clientId) {
   console.warn('[MSAL] VITE_MSAL_CLIENT_ID not set — auth will not work');
 }
 
+export const msalConfigured = Boolean(clientId && clientId !== 'not-configured');
+
 export const msalConfig: Configuration = {
   auth: {
     clientId: clientId || 'not-configured',

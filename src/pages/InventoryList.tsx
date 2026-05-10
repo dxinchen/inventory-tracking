@@ -32,15 +32,18 @@ export default function InventoryList() {
   const [search, setSearch] = useState('');
   const [categoryFilter, setCategoryFilter] = useState('');
   const [statusFilter, setStatusFilter] = useState('');
+  const [showStubs, setShowStubs] = useState(false);
   const [sortKey, setSortKey] = useState<SortKey>('sku');
   const [sortDir, setSortDir] = useState<SortDir>('asc');
 
-  const categories = useMemo(() => [...new Set(items.map(i => i.category))].sort(), [items]);
+  const stubCount = useMemo(() => items.filter(i => i.isStub).length, [items]);
+  const categories = useMemo(() => [...new Set(items.filter(i => showStubs || !i.isStub).map(i => i.category))].sort(), [items, showStubs]);
 
   const filtered = useMemo(() => {
     const q = search.toLowerCase();
     return items
       .filter(item => {
+        if (!showStubs && item.isStub) return false;
         if (q && !item.sku.toLowerCase().includes(q) && !item.name.toLowerCase().includes(q) && !item.supplier.toLowerCase().includes(q)) return false;
         if (categoryFilter && item.category !== categoryFilter) return false;
         if (statusFilter && getStatus(item) !== statusFilter) return false;
@@ -52,7 +55,7 @@ export default function InventoryList() {
         const cmp = typeof aVal === 'number' ? aVal - (bVal as number) : String(aVal).localeCompare(String(bVal));
         return sortDir === 'asc' ? cmp : -cmp;
       });
-  }, [items, search, categoryFilter, statusFilter, sortKey, sortDir]);
+  }, [items, search, categoryFilter, statusFilter, sortKey, sortDir, showStubs]);
 
   function toggleSort(key: SortKey) {
     if (sortKey === key) {
@@ -127,6 +130,17 @@ export default function InventoryList() {
             Clear
           </button>
         )}
+        {stubCount > 0 && (
+          <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }}>
+            <input
+              type="checkbox"
+              checked={showStubs}
+              onChange={e => setShowStubs(e.target.checked)}
+              style={{ accentColor: 'var(--accent)' }}
+            />
+            <span style={{ fontSize: '0.75rem', color: 'var(--text-secondary)' }}>Show stubs ({stubCount})</span>
+          </label>
+        )}
         <div className="toolbar-spacer" />
         <button className="btn btn-primary" onClick={() => navigate('/inventory/new')}>
           + New Item
@@ -154,8 +168,8 @@ export default function InventoryList() {
               {filtered.map(item => {
                 const status = getStatus(item);
                 return (
-                  <tr key={item.id} onClick={() => navigate(`/inventory/${item.id}`)} style={{ cursor: 'pointer' }}>
-                    <td className="cell-sku">{item.sku}</td>
+                  <tr key={item.id} onClick={() => navigate(`/inventory/${item.id}`)} style={{ cursor: 'pointer', opacity: item.isStub ? 0.7 : 1 }}>
+                    <td className="cell-sku">{item.sku}{item.isStub && <> <span className="badge badge--low" style={{ fontSize: '0.6rem' }}>STUB</span></>}</td>
                     <td className="cell-name">{item.name}</td>
                     <td className={`cell-qty cell-qty--${statusBadge[status]}`}>{item.quantity}</td>
                     <td className="cell-mono">{item.location}</td>

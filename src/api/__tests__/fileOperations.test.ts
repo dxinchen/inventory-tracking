@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // Mock the auth module before importing anything that uses it
-vi.mock('../../auth/AuthProvider', () => ({
+vi.mock('../../auth/msalInstance', () => ({
   msalInstance: {
     getActiveAccount: () => ({ username: 'test@biolabs.com' }),
     acquireTokenSilent: () => Promise.resolve({ accessToken: 'mock-token' }),

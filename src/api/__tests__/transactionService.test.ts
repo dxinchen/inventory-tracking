@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 
 // Mock auth
-vi.mock('../../auth/AuthProvider', () => ({
+vi.mock('../../auth/msalInstance', () => ({
   msalInstance: {
     getActiveAccount: () => ({ username: 'test@biolabs.com' }),
     acquireTokenSilent: () => Promise.resolve({ accessToken: 'mock-token' }),

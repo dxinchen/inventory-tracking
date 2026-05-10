@@ -1,6 +1,7 @@
-import { useState, useMemo, useRef, useEffect } from 'react';
+import { useState, useMemo, useRef, useEffect, useCallback } from 'react';
 import { useInventory } from '../context/InventoryContext';
 import type { InventoryItem } from '../models/inventory';
+import { useClickOutside } from '../hooks/useClickOutside';
 
 type Direction = 'in' | 'out';
 
@@ -15,23 +16,17 @@ export default function StockForm() {
   const [expirationDate, setExpirationDate] = useState('');
   const [showDropdown, setShowDropdown] = useState(false);
   const [toast, setToast] = useState<{ type: 'success' | 'error'; msg: string } | null>(null);
+  const [submitting, setSubmitting] = useState(false);
   const dropdownRef = useRef<HTMLDivElement>(null);
 
   const filteredItems = useMemo(() => {
-    if (!searchQuery) return items;
+    const visible = items.filter(i => !i.isStub);
+    if (!searchQuery) return visible;
     const q = searchQuery.toLowerCase();
-    return items.filter(i => i.sku.toLowerCase().includes(q) || i.name.toLowerCase().includes(q));
-  }, [searchQuery]);
+    return visible.filter(i => i.sku.toLowerCase().includes(q) || i.name.toLowerCase().includes(q));
+  }, [items, searchQuery]);
 
-  useEffect(() => {
-    function handleClickOutside(e: MouseEvent) {
-      if (dropdownRef.current && !dropdownRef.current.contains(e.target as Node)) {
-        setShowDropdown(false);
-      }
-    }
-    document.addEventListener('mousedown', handleClickOutside);
-    return () => document.removeEventListener('mousedown', handleClickOutside);
-  }, []);
+  useClickOutside(dropdownRef, useCallback(() => setShowDropdown(false), []), showDropdown);
 
   useEffect(() => {
     if (toast) {
@@ -40,8 +35,8 @@ export default function StockForm() {
     }
   }, [toast]);
 
-  function handleSubmit() {
-    if (!selectedItem) return;
+  async function handleSubmit() {
+    if (!selectedItem || submitting) return;
     const qty = parseInt(quantity, 10);
     if (!qty || qty <= 0) {
       setToast({ type: 'error', msg: 'Quantity must be greater than 0' });
@@ -52,27 +47,33 @@ export default function StockForm() {
       return;
     }
 
-    if (direction === 'in') {
-      stockIn(selectedItem.id, qty, {
-        lotNumber: lotNumber || undefined,
-        expirationDate: expirationDate || undefined,
-        note: note || undefined,
-      });
-    } else {
-      stockOut(selectedItem.id, qty, note || undefined);
+    setSubmitting(true);
+    try {
+      if (direction === 'in') {
+        await stockIn(selectedItem.id, qty, {
+          lotNumber: lotNumber || undefined,
+          expirationDate: expirationDate || undefined,
+          note: note || undefined,
+        });
+      } else {
+        await stockOut(selectedItem.id, qty, note || undefined);
+      }
+      const verb = direction === 'in' ? 'Received' : 'Used';
+      setToast({ type: 'success', msg: `${verb} ${qty}x ${selectedItem.name}` });
+      setQuantity('');
+      setNote('');
+      setLotNumber('');
+      setExpirationDate('');
+      setSelectedItem(null);
+      setSearchQuery('');
+    } catch (err) {
+      setToast({ type: 'error', msg: err instanceof Error ? err.message : String(err) });
+    } finally {
+      setSubmitting(false);
     }
-
-    const verb = direction === 'in' ? 'Received' : 'Used';
-    setToast({ type: 'success', msg: `${verb} ${qty}x ${selectedItem.name}` });
-    setQuantity('');
-    setNote('');
-    setLotNumber('');
-    setExpirationDate('');
-    setSelectedItem(null);
-    setSearchQuery('');
   }
 
-  const isValid = selectedItem && quantity && parseInt(quantity, 10) > 0;
+  const isValid = selectedItem && quantity && parseInt(quantity, 10) > 0 && !submitting;
 
   return (
     <main className="page">
@@ -237,7 +238,7 @@ export default function StockForm() {
           {/* Submit */}
           <div className="btn-group" style={{ justifyContent: 'flex-end' }}>
             <button className="btn btn-primary" disabled={!isValid} onClick={handleSubmit}>
-              {direction === 'in' ? 'Record Receiving' : 'Record Usage'}
+              {submitting ? 'Saving...' : (direction === 'in' ? 'Record Receiving' : 'Record Usage')}
             </button>
           </div>
         </div>

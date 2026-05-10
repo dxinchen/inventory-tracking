@@ -44,12 +44,13 @@ export default function ItemDetail() {
       referenceNumber: item!.referenceNumber,
       unitCost: item!.unitCost != null ? String(item!.unitCost) : '',
       reorderPoint: String(item!.reorderPoint),
+      unitOfMeasure: item!.unitOfMeasure || '',
     });
     setEditing(true);
   }
 
-  function saveEdit() {
-    const changes: Record<string, string | number> = {};
+  async function saveEdit() {
+    const changes: Record<string, string | number | undefined> = {};
     if (form.name !== item!.name) changes.name = form.name;
     if (form.location !== item!.location) changes.location = form.location;
     if (form.category !== item!.category) changes.category = form.category;
@@ -58,21 +59,35 @@ export default function ItemDetail() {
     if (form.referenceNumber !== item!.referenceNumber) changes.referenceNumber = form.referenceNumber;
     if (form.unitCost && parseFloat(form.unitCost) !== (item!.unitCost ?? 0)) changes.unitCost = parseFloat(form.unitCost);
     if (parseInt(form.reorderPoint, 10) !== item!.reorderPoint) changes.reorderPoint = parseInt(form.reorderPoint, 10);
+    // unitOfMeasure: empty-string → undefined so Zod's .min(1).optional() doesn't reject blank inputs
+    const newUom = form.unitOfMeasure?.trim() || undefined;
+    if (newUom !== item!.unitOfMeasure) changes.unitOfMeasure = newUom;
 
     if (Object.keys(changes).length === 0) {
       setEditing(false);
       return;
     }
 
-    updateItem(item!.id, changes);
-    setEditing(false);
-    setToast({ type: 'success', msg: `Updated ${Object.keys(changes).length} field(s)` });
-    setTimeout(() => setToast(null), 3000);
+    try {
+      await updateItem(item!.id, changes);
+      setEditing(false);
+      setToast({ type: 'success', msg: `Updated ${Object.keys(changes).length} field(s)` });
+      setTimeout(() => setToast(null), 3000);
+    } catch (err) {
+      setToast({ type: 'error', msg: err instanceof Error ? err.message : String(err) });
+      setTimeout(() => setToast(null), 5000);
+    }
   }
 
-  function handleDelete() {
-    deleteItem(item!.id, 'Deleted via UI');
-    navigate('/inventory');
+  async function handleDelete() {
+    try {
+      await deleteItem(item!.id, 'Deleted via UI');
+      navigate('/inventory');
+    } catch (err) {
+      setToast({ type: 'error', msg: err instanceof Error ? err.message : String(err) });
+      setTimeout(() => setToast(null), 5000);
+      setConfirmDelete(false);
+    }
   }
 
   const typeLabels: Record<string, string> = {
@@ -81,6 +96,9 @@ export default function ItemDetail() {
     'item-create': 'Created',
     'item-update': 'Updated',
     'item-delete': 'Deleted',
+    'order-create': 'Order Placed',
+    'order-receive': 'Order Received',
+    'order-cancel': 'Order Cancelled',
   };
 
   const typeBadge: Record<string, string> = {
@@ -89,6 +107,9 @@ export default function ItemDetail() {
     'item-create': 'create',
     'item-update': 'update',
     'item-delete': 'critical',
+    'order-create': 'create',
+    'order-receive': 'stock-in',
+    'order-cancel': 'critical',
   };
 
   return (
@@ -144,6 +165,7 @@ export default function ItemDetail() {
                   ['Reference #', item.referenceNumber, 'referenceNumber'],
                   ['Unit Cost', item.unitCost != null ? `$${item.unitCost.toFixed(2)}` : '—', 'unitCost'],
                   ['Reorder Point', String(item.reorderPoint), 'reorderPoint'],
+                  ['Unit of Measure', item.unitOfMeasure || 'each', 'unitOfMeasure'],
                   ['Quantity', String(item.quantity), null],
                   ['Earliest Expiry', item.earliestExpiration ? new Date(item.earliestExpiration).toLocaleDateString() : 'None', null],
                 ] as [string, string, string | null][]).map(([label, value, editKey]) => (

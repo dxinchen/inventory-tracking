@@ -27,6 +27,8 @@ const makeItem = (overrides: Partial<InventoryItem> = {}): InventoryItem => ({
   earliestExpiration: '',
   createdBy: 'test@company.com',
   updatedAt: '2026-04-03T10:00:00Z',
+  unitOfMeasure: 'each',
+  isStub: false,
   ...overrides,
 });
 

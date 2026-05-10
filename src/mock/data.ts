@@ -1,3 +1,6 @@
+import type { Order } from '../models/order';
+import { daysFromTodayISO, todayISO } from '../utils/dates';
+
 export interface Batch {
   lotNumber: string;
   expirationDate: string;
@@ -20,13 +23,15 @@ export interface InventoryItem {
   imageFilename?: string;
   createdBy: string;
   updatedAt: string;
+  unitOfMeasure: string;
+  isStub: boolean;
   batches: Batch[];
   earliestExpiration: string;
 }
 
 export interface Transaction {
   id: string;
-  type: 'stock-in' | 'stock-out' | 'item-create' | 'item-update' | 'item-delete';
+  type: 'stock-in' | 'stock-out' | 'item-create' | 'item-update' | 'item-delete' | 'order-create' | 'order-receive' | 'order-cancel';
   itemId: string;
   data: Record<string, unknown>;
   performedBy: string;
@@ -40,6 +45,7 @@ export const mockItems: InventoryItem[] = [
     supplier: 'Thermo Fisher', unitCost: 42.00, reorderPoint: 500,
     vendor: 'Thermo Fisher Scientific', referenceNumber: 'PO-2026-0041',
     createdBy: 'j.martinez@biolabs.com', updatedAt: '2026-04-02T14:30:00Z',
+    unitOfMeasure: 'box', isStub: false,
     earliestExpiration: '2026-12-01',
     batches: [
       { lotNumber: 'TF-24A109', expirationDate: '2026-12-01', quantity: 400, receivedAt: '2026-01-15T10:00:00Z' },
@@ -52,6 +58,7 @@ export const mockItems: InventoryItem[] = [
     supplier: 'Eppendorf', unitCost: 85.50, reorderPoint: 50,
     vendor: 'Eppendorf North America', referenceNumber: 'PO-2026-0038',
     createdBy: 'k.chen@biolabs.com', updatedAt: '2026-04-03T09:15:00Z',
+    unitOfMeasure: 'box', isStub: false,
     earliestExpiration: '',
     batches: [{ lotNumber: 'EP-26M03', expirationDate: '', quantity: 8, receivedAt: '2026-03-10T09:00:00Z' }],
   },
@@ -61,6 +68,7 @@ export const mockItems: InventoryItem[] = [
     supplier: 'New England Biolabs', unitCost: 148.00, reorderPoint: 5,
     vendor: 'NEB', referenceNumber: 'PO-2026-0029',
     createdBy: 'j.martinez@biolabs.com', updatedAt: '2026-04-01T11:00:00Z',
+    unitOfMeasure: 'each', isStub: false,
     earliestExpiration: '',
     batches: [],
   },
@@ -70,6 +78,7 @@ export const mockItems: InventoryItem[] = [
     supplier: 'Gibco', unitCost: 18.90, reorderPoint: 10,
     vendor: 'Thermo Fisher Scientific', referenceNumber: 'PO-2026-0035',
     createdBy: 'r.patel@biolabs.com', updatedAt: '2026-03-29T16:45:00Z',
+    unitOfMeasure: 'each', isStub: false,
     earliestExpiration: '2026-09-30',
     batches: [
       { lotNumber: 'GB-2401A', expirationDate: '2026-09-30', quantity: 12, receivedAt: '2026-01-20T10:00:00Z' },
@@ -82,6 +91,7 @@ export const mockItems: InventoryItem[] = [
     supplier: 'BioLegend', unitCost: 320.00, reorderPoint: 3,
     vendor: 'BioLegend Inc', referenceNumber: 'PO-2026-0042',
     createdBy: 'k.chen@biolabs.com', updatedAt: '2026-04-03T07:30:00Z',
+    unitOfMeasure: 'each', isStub: false,
     earliestExpiration: '2026-04-18',
     batches: [
       { lotNumber: 'BL-B401552', expirationDate: '2026-04-18', quantity: 1, receivedAt: '2025-11-05T10:00:00Z' },
@@ -94,6 +104,7 @@ export const mockItems: InventoryItem[] = [
     supplier: 'Sigma-Aldrich', unitCost: 65.00, reorderPoint: 4,
     vendor: 'MilliporeSigma', referenceNumber: 'PO-2026-0033',
     createdBy: 'r.patel@biolabs.com', updatedAt: '2026-03-31T13:20:00Z',
+    unitOfMeasure: 'each', isStub: false,
     earliestExpiration: '',
     batches: [{ lotNumber: 'SA-SHBQ4532', expirationDate: '', quantity: 12, receivedAt: '2026-03-31T13:20:00Z' }],
   },
@@ -103,6 +114,7 @@ export const mockItems: InventoryItem[] = [
     supplier: 'VWR International', unitCost: 14.99, reorderPoint: 20,
     vendor: 'Avantor / VWR', referenceNumber: 'PO-2026-0040',
     createdBy: 'j.martinez@biolabs.com', updatedAt: '2026-04-02T10:10:00Z',
+    unitOfMeasure: 'box', isStub: false,
     earliestExpiration: '',
     batches: [{ lotNumber: 'VWR-G26M02', expirationDate: '', quantity: 6, receivedAt: '2026-02-15T10:00:00Z' }],
   },
@@ -112,6 +124,7 @@ export const mockItems: InventoryItem[] = [
     supplier: 'R&D Systems', unitCost: 495.00, reorderPoint: 2,
     vendor: 'Bio-Techne / R&D Systems', referenceNumber: 'PO-2026-0031',
     createdBy: 'k.chen@biolabs.com', updatedAt: '2026-04-01T09:00:00Z',
+    unitOfMeasure: 'kit', isStub: false,
     earliestExpiration: '2026-04-28',
     batches: [{ lotNumber: 'RD-P260114', expirationDate: '2026-04-28', quantity: 3, receivedAt: '2026-01-14T10:00:00Z' }],
   },
@@ -121,6 +134,7 @@ export const mockItems: InventoryItem[] = [
     supplier: 'Gibco', unitCost: 385.00, reorderPoint: 3,
     vendor: 'Thermo Fisher Scientific', referenceNumber: 'PO-2026-0039',
     createdBy: 'r.patel@biolabs.com', updatedAt: '2026-04-03T08:00:00Z',
+    unitOfMeasure: 'each', isStub: false,
     earliestExpiration: '2026-04-10',
     batches: [
       { lotNumber: 'GB-FBS2401', expirationDate: '2026-04-10', quantity: 1, receivedAt: '2025-10-15T10:00:00Z' },
@@ -133,6 +147,7 @@ export const mockItems: InventoryItem[] = [
     supplier: 'New England Biolabs', unitCost: 62.00, reorderPoint: 4,
     vendor: 'NEB', referenceNumber: 'PO-2026-0044',
     createdBy: 'j.martinez@biolabs.com', updatedAt: '2026-03-28T15:00:00Z',
+    unitOfMeasure: 'each', isStub: false,
     earliestExpiration: '2027-01-30',
     batches: [{ lotNumber: 'NEB-10117S', expirationDate: '2027-01-30', quantity: 18, receivedAt: '2026-03-28T15:00:00Z' }],
   },
@@ -201,6 +216,52 @@ export const mockTransactions: Transaction[] = [
   },
 ];
 
+
+export const mockOrders: Order[] = [
+  {
+    id: 'o1',
+    poNumber: 'PO-2026-0050',
+    orderConfirmationNumber: 'TF-CONF-882491',
+    supplier: 'Thermo Fisher',
+    orderDate: daysFromTodayISO(-7),
+    expectedDeliveryDate: daysFromTodayISO(3),
+    actualReceiveDate: null,
+    status: 'placed',
+    lineItems: [
+      {
+        id: 'ol1', itemId: 'a1', name: 'PCR Tubes 0.2mL (1000pk)',
+        unitOfMeasure: 'box', quantityOrdered: 10, quantityReceived: null,
+        unitCost: 42.00, lotNumber: null, expirationDate: null,
+      },
+    ],
+    attachments: [],
+    createdBy: 'j.martinez@biolabs.com',
+    updatedAt: todayISO(),
+    note: null,
+  },
+  {
+    id: 'o2',
+    poNumber: 'PO-2026-0051',
+    orderConfirmationNumber: 'NEB-CONF-100221',
+    supplier: 'New England Biolabs',
+    orderDate: daysFromTodayISO(-2),
+    expectedDeliveryDate: daysFromTodayISO(-1),
+    actualReceiveDate: null,
+    status: 'placed',
+    lineItems: [
+      {
+        id: 'ol2', itemId: 'a3', name: 'Taq DNA Polymerase 500U',
+        unitOfMeasure: 'each', quantityOrdered: 5, quantityReceived: null,
+        unitCost: 148.00, lotNumber: null, expirationDate: null,
+      },
+    ],
+    attachments: [],
+    createdBy: 'k.chen@biolabs.com',
+    updatedAt: todayISO(),
+    note: null,
+  },
+];
+
 // Helpers
 export function getItemById(id: string): InventoryItem | undefined {
   return mockItems.find(item => item.id === id);
@@ -215,7 +276,7 @@ export function getItemSku(itemId: string): string {
 }
 
 export function getLowStockItems(): InventoryItem[] {
-  return mockItems.filter(item => item.quantity <= item.reorderPoint);
+  return mockItems.filter(item => !item.isStub && item.quantity <= item.reorderPoint);
 }
 
 export function getExpiringItems(withinDays = 30): InventoryItem[] {
