@@ -22,7 +22,7 @@ interface AuthGateProps {
 export default function AuthGate({ children }: AuthGateProps) {
   if (!msalConfigured) {
     // Dev mode — no MSAL, skip auth
-    return <>{children({ userEmail: 'd.chen@biolabs.com' })}</>;
+    return <>{children({ userEmail: 'chendong@gmail.com' })}</>;
   }
 
   // MSAL mode — dynamically import to avoid crashing when not configured

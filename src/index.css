@@ -785,6 +785,19 @@ a {
   gap: 16px;
 }
 
+.order-line-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 120px 100px 120px 90px;
+  gap: 16px;
+  align-items: start;
+}
+
+@media (max-width: 720px) {
+  .order-line-row {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+
 .form-hint {
   font-family: var(--font-mono);
   font-size: 0.65rem;

@@ -20,6 +20,7 @@ const ADMIN_ROLE = 'Admin';
  */
 const DEV_ADMINS: string[] = [
   'xdu@mabwell-therapeutics.com',
+  'chendong@gmail.com',
 ];
 
 export function isAdmin(email?: string): boolean {

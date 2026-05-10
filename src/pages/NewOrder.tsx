@@ -1,10 +1,10 @@
 import { useState, useMemo, useRef, useEffect, useCallback } from 'react';
-import { useNavigate, useSearchParams, Navigate } from 'react-router-dom';
+import { useNavigate, useSearchParams, Navigate, Link } from 'react-router-dom';
 import { useInventory } from '../context/InventoryContext';
 import type { OrderCreateInput } from '../context/inventoryTypes';
 import type { InventoryItem } from '../models/inventory';
-import type { Order } from '../models/order';
-import { ATTACHMENT_ACCEPT_ATTRIBUTE, mergeFilesDedup } from '../api/attachmentService';
+import type { Order, OrderAttachment } from '../models/order';
+import { ATTACHMENT_ACCEPT_ATTRIBUTE, mergeFilesDedup, getOrderAttachmentUrl } from '../api/attachmentService';
 import { useClickOutside } from '../hooks/useClickOutside';
 
 interface DraftLine {
@@ -160,6 +160,24 @@ function OrderForm({ predecessor }: { predecessor: Order | null }) {
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // Open the predecessor's attachment in a new tab. Open the window
+  // synchronously so the popup blocker treats it as user-initiated, then
+  // navigate it to the pre-signed URL once it resolves.
+  function openPredecessorAttachment(att: OrderAttachment) {
+    if (!predecessor) return;
+    const win = window.open('', '_blank');
+    if (!win) {
+      setError('Popup blocked — allow popups for this site to open attachments.');
+      return;
+    }
+    getOrderAttachmentUrl(predecessor.id, att.filename)
+      .then((url) => { win.location.href = url; })
+      .catch((err) => {
+        win.close();
+        setError(`Failed to open ${att.originalFilename}: ${err instanceof Error ? err.message : String(err)}`);
+      });
+  }
+
   const knownSuppliers = useMemo(
     () => [...new Set([...items.map(i => i.supplier), ...orders.map(o => o.supplier)])].filter(Boolean).sort(),
     [items, orders],
@@ -282,7 +300,16 @@ function OrderForm({ predecessor }: { predecessor: Order | null }) {
           Editing PO {predecessor!.poNumber} — saving cancels the original and creates a replacement
           in one atomic batch. Closing this tab without saving leaves the original active.
           Attach any documents you want on the replacement below; the predecessor's documents
-          remain on the cancelled order.
+          remain on the cancelled order (
+          <Link
+            to={`/orders/${predecessor!.id}`}
+            target="_blank"
+            rel="noreferrer"
+            style={{ color: 'inherit', textDecoration: 'underline' }}
+          >
+            view original
+          </Link>
+          ).
         </div>
       )}
 
@@ -374,8 +401,8 @@ function OrderForm({ predecessor }: { predecessor: Order | null }) {
           <div className="stock-form-body">
             {lines.map((line, i) => (
               <div key={line.rowKey} style={{ borderBottom: i < lines.length - 1 ? '1px solid var(--border)' : 'none', paddingBottom: '12px', marginBottom: '12px' }}>
-                <div className="form-row">
-                  <div className="form-group" style={{ flex: 2 }}>
+                <div className="order-line-row">
+                  <div className="form-group">
                     <label className="form-label">Item *</label>
                     <ItemPicker
                       index={i}
@@ -396,7 +423,7 @@ function OrderForm({ predecessor }: { predecessor: Order | null }) {
                       </span>
                     )}
                   </div>
-                  <div className="form-group" style={{ maxWidth: '120px' }}>
+                  <div className="form-group">
                     <label className="form-label">UoM *</label>
                     <input
                       className="form-input"
@@ -405,7 +432,7 @@ function OrderForm({ predecessor }: { predecessor: Order | null }) {
                       onChange={(e) => updateLine(line.rowKey, { unitOfMeasure: e.target.value })}
                     />
                   </div>
-                  <div className="form-group" style={{ maxWidth: '100px' }}>
+                  <div className="form-group">
                     <label className="form-label">Qty *</label>
                     <input
                       className="form-input"
@@ -415,7 +442,7 @@ function OrderForm({ predecessor }: { predecessor: Order | null }) {
                       onChange={(e) => updateLine(line.rowKey, { quantityOrdered: e.target.value })}
                     />
                   </div>
-                  <div className="form-group" style={{ maxWidth: '120px' }}>
+                  <div className="form-group">
                     <label className="form-label">Unit Cost *</label>
                     <input
                       className="form-input"
@@ -426,7 +453,8 @@ function OrderForm({ predecessor }: { predecessor: Order | null }) {
                       onChange={(e) => updateLine(line.rowKey, { unitCost: e.target.value })}
                     />
                   </div>
-                  <div className="form-group" style={{ maxWidth: '90px', alignSelf: 'flex-end' }}>
+                  <div className="form-group">
+                    <label className="form-label" aria-hidden="true">&nbsp;</label>
                     {lines.length > 1 && (
                       <button type="button" className="btn btn-secondary" onClick={() => removeRow(line.rowKey)}>
                         Remove
@@ -446,11 +474,40 @@ function OrderForm({ predecessor }: { predecessor: Order | null }) {
           <div className="panel__header">
             <span className="panel__title">
               <span className="panel__title-dot" style={{ background: 'var(--accent)' }} />
-              Order Documents (optional)
+              {isEditMode ? 'Replacement Documents (optional)' : 'Order Documents (optional)'}
             </span>
             <span className="panel__count">{attachments.length} files</span>
           </div>
           <div className="stock-form-body">
+            {isEditMode && predecessor && predecessor.attachments.length > 0 && (
+              <div>
+                <div style={{ fontSize: '0.7rem', color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: '8px' }}>
+                  On predecessor PO {predecessor.poNumber} — stays with the cancelled original, will not carry over
+                </div>
+                <ul className="activity-list" style={{ marginBottom: '16px' }}>
+                  {predecessor.attachments.map((a) => (
+                    <li key={a.id} className="activity-item">
+                      <div className="activity-content">
+                        <div className="activity-text">{a.originalFilename}</div>
+                        <div className="activity-meta">
+                          <span>{a.stage}</span>
+                          <span>{(a.sizeBytes / 1024).toFixed(1)} KB</span>
+                          <span>{new Date(a.uploadedAt).toLocaleDateString()}</span>
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        className="btn btn-secondary"
+                        style={{ padding: '4px 10px', fontSize: '0.7rem' }}
+                        onClick={() => openPredecessorAttachment(a)}
+                      >
+                        Open
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
             <input
               type="file"
               multiple

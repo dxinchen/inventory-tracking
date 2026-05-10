@@ -1,4 +1,5 @@
 import { useState, useRef } from 'react';
+import { Link } from 'react-router-dom';
 import { useInventory } from '../context/InventoryContext';
 
 interface ParsedRow {
@@ -224,9 +225,9 @@ export default function Import() {
               <div className="action-card__desc">
                 Go to the Export page and download the CSV Template to get started with the correct column format.
               </div>
-              <a href="/export" className="btn btn-secondary" style={{ width: 'fit-content' }}>
+              <Link to="/export" className="btn btn-secondary" style={{ width: 'fit-content' }}>
                 Go to Export
-              </a>
+              </Link>
             </div>
           </div>
         </div>
