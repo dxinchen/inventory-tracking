@@ -1,4 +1,4 @@
-import { msalInstance } from './AuthProvider';
+import { msalInstance } from './msalInstance';
 
 /**
  * Role-based access control via Azure AD App Roles.

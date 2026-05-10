@@ -13,6 +13,7 @@ interface ParsedRow {
   vendor: string;
   referenceNumber: string;
   expirationDate: string;
+  unitOfMeasure: string;
   status: 'new' | 'exists';
 }
 
@@ -47,6 +48,7 @@ function parseCSV(text: string): Omit<ParsedRow, 'status'>[] {
       vendor: row['vendor'] || '',
       referenceNumber: row['reference number'] || row['referencenumber'] || row['ref #'] || '',
       expirationDate: row['expiration date'] || row['expirationdate'] || '',
+      unitOfMeasure: row['unit of measure'] || row['unitofmeasure'] || row['uom'] || '',
     };
   }).filter(r => r.sku || r.name);
 }
@@ -59,6 +61,7 @@ export default function Import() {
   const [overwrite, setOverwrite] = useState(false);
   const [showOverwriteWarning, setShowOverwriteWarning] = useState(false);
   const [toast, setToast] = useState<{ type: 'success' | 'error'; msg: string } | null>(null);
+  const [importing, setImporting] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
 
   if (!isAdmin) {
@@ -107,21 +110,43 @@ export default function Import() {
     if (file) handleFile(file);
   }
 
-  function handleImport() {
-    const existingSkus = new Set(items.map(i => i.sku.toLowerCase()));
+  async function handleImport() {
+    if (importing) return;
+    setImporting(true);
+    const existingBySku = new Map(items.map(i => [i.sku.toLowerCase(), i]));
     let created = 0;
     let updated = 0;
     let skipped = 0;
+    let failed = 0;
 
-    for (const row of rows) {
-      if (!row.sku || !row.name) continue;
+    try {
+      for (const row of rows) {
+        if (!row.sku || !row.name) continue;
 
-      if (existingSkus.has(row.sku.toLowerCase())) {
-        if (overwrite) {
-          const existing = items.find(i => i.sku.toLowerCase() === row.sku.toLowerCase());
+        try {
+          const existing = existingBySku.get(row.sku.toLowerCase());
           if (existing) {
-            updateItem(existing.id, {
+            if (overwrite) {
+              await updateItem(existing.id, {
+                name: row.name,
+                location: row.location,
+                category: row.category,
+                supplier: row.supplier,
+                unitCost: row.unitCost ? parseFloat(row.unitCost) : undefined,
+                reorderPoint: parseInt(row.reorderPoint, 10) || 0,
+                vendor: row.vendor,
+                referenceNumber: row.referenceNumber,
+                unitOfMeasure: row.unitOfMeasure?.trim() || undefined,
+              });
+              updated++;
+            } else {
+              skipped++;
+            }
+          } else {
+            await addItem({
+              sku: row.sku,
               name: row.name,
+              quantity: parseInt(row.quantity, 10) || 0,
               location: row.location,
               category: row.category,
               supplier: row.supplier,
@@ -129,39 +154,29 @@ export default function Import() {
               reorderPoint: parseInt(row.reorderPoint, 10) || 0,
               vendor: row.vendor,
               referenceNumber: row.referenceNumber,
+              expirationDate: row.expirationDate || undefined,
+              unitOfMeasure: row.unitOfMeasure || 'each',
             });
-            updated++;
+            created++;
           }
-        } else {
-          skipped++;
+        } catch {
+          failed++;
         }
-      } else {
-        addItem({
-          sku: row.sku,
-          name: row.name,
-          quantity: parseInt(row.quantity, 10) || 0,
-          location: row.location,
-          category: row.category,
-          supplier: row.supplier,
-          unitCost: row.unitCost ? parseFloat(row.unitCost) : undefined,
-          reorderPoint: parseInt(row.reorderPoint, 10) || 0,
-          vendor: row.vendor,
-          referenceNumber: row.referenceNumber,
-          expirationDate: row.expirationDate || undefined,
-        });
-        created++;
       }
-    }
 
-    const parts = [];
-    if (created) parts.push(`${created} created`);
-    if (updated) parts.push(`${updated} updated`);
-    if (skipped) parts.push(`${skipped} skipped`);
-    setToast({ type: 'success', msg: parts.join(', ') });
-    setTimeout(() => setToast(null), 4000);
-    setRows([]);
-    setFileName('');
-    setOverwrite(false);
+      const parts = [];
+      if (created) parts.push(`${created} created`);
+      if (updated) parts.push(`${updated} updated`);
+      if (skipped) parts.push(`${skipped} skipped`);
+      if (failed) parts.push(`${failed} failed`);
+      setToast({ type: failed ? 'error' : 'success', msg: parts.join(', ') });
+      setTimeout(() => setToast(null), 4000);
+      setRows([]);
+      setFileName('');
+      setOverwrite(false);
+    } finally {
+      setImporting(false);
+    }
   }
 
   const newRows = rows.filter(r => r.status === 'new' && r.sku && r.name);
@@ -189,7 +204,7 @@ export default function Import() {
               Drop a CSV file here, or click to browse
             </div>
             <div className="upload-zone__hint">
-              Expects columns: SKU, Name, Quantity, Location, Category, Supplier, Vendor, Reference Number, Unit Cost, Reorder Point, Expiration Date
+              Expects columns: SKU, Name, Quantity, Location, Category, Supplier, Vendor, Reference Number, Unit Cost, Reorder Point, Expiration Date, Unit of Measure
             </div>
           </div>
           <input
@@ -248,8 +263,8 @@ export default function Import() {
             <button className="btn btn-secondary" onClick={() => { setRows([]); setFileName(''); setOverwrite(false); }}>
               Clear
             </button>
-            <button className="btn btn-primary" onClick={handleImport} disabled={importCount === 0}>
-              Import {importCount} Items
+            <button className="btn btn-primary" onClick={handleImport} disabled={importCount === 0 || importing}>
+              {importing ? 'Importing...' : `Import ${importCount} Items`}
             </button>
           </div>
 

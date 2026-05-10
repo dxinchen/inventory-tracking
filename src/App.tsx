@@ -9,6 +9,10 @@ import ItemDetail from './pages/ItemDetail';
 import StockForm from './pages/StockForm';
 import Export from './pages/Export';
 import Import from './pages/Import';
+import OrdersList from './pages/OrdersList';
+import NewOrder from './pages/NewOrder';
+import OrderDetail from './pages/OrderDetail';
+import ReceiveOrder from './pages/ReceiveOrder';
 
 function NavBar({ userEmail, onLogout }: { userEmail: string; onLogout?: () => void }) {
   const initials = userEmail
@@ -39,6 +43,11 @@ function NavBar({ userEmail, onLogout }: { userEmail: string; onLogout?: () => v
         <li>
           <NavLink to="/stock" className={({ isActive }) => `nav-link${isActive ? ' active' : ''}`}>
             Stock In/Out
+          </NavLink>
+        </li>
+        <li>
+          <NavLink to="/orders" className={({ isActive }) => `nav-link${isActive ? ' active' : ''}`}>
+            Orders
           </NavLink>
         </li>
         <li>
@@ -73,6 +82,10 @@ function AppShell({ userEmail, onLogout }: { userEmail: string; onLogout?: () =>
         <Route path="/inventory/new" element={<NewItem />} />
         <Route path="/inventory/:id" element={<ItemDetail />} />
         <Route path="/stock" element={<StockForm />} />
+        <Route path="/orders" element={<OrdersList />} />
+        <Route path="/orders/new" element={<NewOrder />} />
+        <Route path="/orders/:id" element={<OrderDetail />} />
+        <Route path="/orders/:id/receive" element={<ReceiveOrder />} />
         <Route path="/import" element={<Import />} />
         <Route path="/export" element={<Export />} />
         <Route path="*" element={<Navigate to="/" replace />} />

@@ -1,3 +1,4 @@
+import { useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   timeAgo,
@@ -6,20 +7,29 @@ import {
 } from '../mock/data';
 import { useInventory } from '../context/InventoryContext';
 import type { InventoryItem } from '../models/inventory';
-import type { StockData } from '../models/transaction';
+import type { Order } from '../models/order';
+import type { StockData, OrderCreateData } from '../models/transaction';
+import { todayISO } from '../utils/dates';
 
-function SummaryCards({ items }: { items: InventoryItem[] }) {
-  const totalItems = items.length;
-  const totalUnits = items.reduce((s, i) => s + i.quantity, 0);
-  const lowStock = items.filter(i => i.quantity <= i.reorderPoint);
-  const expiring = items.filter(i => {
+function SummaryCards({ items, orders }: { items: InventoryItem[]; orders: Order[] }) {
+  const navigate = useNavigate();
+  const realItems = useMemo(() => items.filter(i => !i.isStub), [items]);
+  const lowStock = useMemo(() => realItems.filter(i => i.quantity <= i.reorderPoint), [realItems]);
+  const expiring = useMemo(() => realItems.filter(i => {
     if (!i.earliestExpiration) return false;
     const days = daysUntil(i.earliestExpiration);
     return days >= 0 && days <= 30;
-  });
+  }), [realItems]);
+  const openOrders = useMemo(() => orders.filter(o => o.status === 'placed'), [orders]);
+  const overdueOrders = useMemo(() => {
+    const today = todayISO();
+    return openOrders.filter(o => o.expectedDeliveryDate && o.expectedDeliveryDate < today);
+  }, [openOrders]);
+  const totalItems = realItems.length;
+  const totalUnits = realItems.reduce((s, i) => s + i.quantity, 0);
 
   return (
-    <div className="summary-row" style={{ gridTemplateColumns: 'repeat(3, 1fr)' }}>
+    <div className="summary-row" style={{ gridTemplateColumns: 'repeat(4, 1fr)' }}>
       <div className="summary-card">
         <div className="summary-card__label">Total Products</div>
         <div className="summary-card__value">{totalItems}</div>
@@ -45,13 +55,28 @@ function SummaryCards({ items }: { items: InventoryItem[] }) {
         <div className="summary-card__value">{expiring.length}</div>
         <div className="summary-card__detail">within next 30 days</div>
       </div>
+
+      <div
+        className={`summary-card ${overdueOrders.length > 0 ? 'summary-card--warning' : ''}`}
+        onClick={() => navigate('/orders')}
+        style={{ cursor: 'pointer' }}
+      >
+        <div className="summary-card__label">Open Orders</div>
+        <div className={`summary-card__value ${overdueOrders.length > 0 ? 'summary-card__value--warning' : ''}`}>{openOrders.length}</div>
+        <div className="summary-card__detail">
+          {overdueOrders.length > 0 ? `${overdueOrders.length} overdue` : 'placed, awaiting receipt'}
+        </div>
+      </div>
     </div>
   );
 }
 
 function LowStockTable({ items }: { items: InventoryItem[] }) {
   const navigate = useNavigate();
-  const lowItems = items.filter(i => i.quantity <= i.reorderPoint).sort((a, b) => a.quantity - b.quantity);
+  const lowItems = useMemo(
+    () => items.filter(i => !i.isStub && i.quantity <= i.reorderPoint).sort((a, b) => a.quantity - b.quantity),
+    [items],
+  );
 
   return (
     <div className="panel" style={{ animationDelay: '0.25s' }}>
@@ -98,17 +123,20 @@ function LowStockTable({ items }: { items: InventoryItem[] }) {
   );
 }
 
-function ActivityFeed() {
-  const { transactions, items } = useInventory();
-  const recent = [...transactions].reverse().slice(0, 10);
+const ACTIVITY_TYPE_CONFIG: Record<string, { icon: string; iconClass: string }> = {
+  'stock-in': { icon: '↓', iconClass: 'in' },
+  'stock-out': { icon: '↑', iconClass: 'out' },
+  'item-create': { icon: '+', iconClass: 'create' },
+  'item-update': { icon: '✎', iconClass: 'update' },
+  'item-delete': { icon: '✕', iconClass: 'out' },
+  'order-create': { icon: '⋯', iconClass: 'create' },
+  'order-receive': { icon: '✓', iconClass: 'in' },
+  'order-cancel': { icon: '✕', iconClass: 'out' },
+};
 
-  const typeConfig: Record<string, { icon: string; iconClass: string }> = {
-    'stock-in': { icon: '\u2193', iconClass: 'in' },
-    'stock-out': { icon: '\u2191', iconClass: 'out' },
-    'item-create': { icon: '+', iconClass: 'create' },
-    'item-update': { icon: '\u270E', iconClass: 'update' },
-    'item-delete': { icon: '\u2715', iconClass: 'out' },
-  };
+function ActivityFeed() {
+  const { transactions, items, orders } = useInventory();
+  const recent = useMemo(() => transactions.slice(-10).reverse(), [transactions]);
 
   function getItemInfo(itemId: string) {
     const item = items.find(i => i.id === itemId);
@@ -116,49 +144,87 @@ function ActivityFeed() {
   }
 
   function renderText(tx: typeof recent[0]) {
-    const { name, sku } = getItemInfo(tx.itemId);
-    const qty = (tx.data as StockData).quantity;
-    const note = (tx.data as StockData).note as string | undefined;
-
     switch (tx.type) {
-      case 'stock-in':
+      case 'stock-in': {
+        const d = tx.data as StockData;
+        const { name, sku } = getItemInfo(tx.itemId);
+        const linkedOrder = d.orderId ? orders.find(o => o.id === d.orderId) : undefined;
+        const suffix = linkedOrder
+          ? linkedOrder.status === 'cancelled'
+            ? ` (via cancelled PO-${linkedOrder.poNumber})`
+            : ` (via PO-${linkedOrder.poNumber})`
+          : '';
         return (
           <>
-            Received <span className="qty-change qty-change--plus">+{qty}</span>{' '}
+            Received <span className="qty-change qty-change--plus">+{d.quantity}</span>{' '}
             <strong>{name}</strong> <span className="cell-sku" style={{ fontSize: '0.65rem' }}>({sku})</span>
-            {note && <> — {note}</>}
+            {d.note && <> {'—'} {d.note}</>}
+            {suffix}
           </>
         );
-      case 'stock-out':
+      }
+      case 'stock-out': {
+        const d = tx.data as StockData;
+        const { name, sku } = getItemInfo(tx.itemId);
         return (
           <>
-            Used <span className="qty-change qty-change--minus">-{qty}</span>{' '}
+            Used <span className="qty-change qty-change--minus">-{d.quantity}</span>{' '}
             <strong>{name}</strong> <span className="cell-sku" style={{ fontSize: '0.65rem' }}>({sku})</span>
-            {note && <> — {note}</>}
+            {d.note && <> {'—'} {d.note}</>}
           </>
         );
-      case 'item-create':
+      }
+      case 'item-create': {
+        const { name, sku } = getItemInfo(tx.itemId);
         return (
           <>
             Created new item <strong>{name}</strong>{' '}
             <span className="cell-sku" style={{ fontSize: '0.65rem' }}>({sku})</span>
           </>
         );
-      case 'item-update':
+      }
+      case 'item-update': {
+        const { name, sku } = getItemInfo(tx.itemId);
+        const note = (tx.data as { note?: string }).note;
         return (
           <>
             Updated <strong>{name}</strong>{' '}
             <span className="cell-sku" style={{ fontSize: '0.65rem' }}>({sku})</span>
-            {note && <> — {note}</>}
+            {note && <> {'—'} {note}</>}
           </>
         );
-      case 'item-delete':
+      }
+      case 'item-delete': {
+        const { name, sku } = getItemInfo(tx.itemId);
         return (
           <>
             Deleted <strong>{name}</strong>{' '}
             <span className="cell-sku" style={{ fontSize: '0.65rem' }}>({sku})</span>
           </>
         );
+      }
+      case 'order-create': {
+        const order = orders.find(o => o.id === tx.itemId);
+        const d = tx.data as OrderCreateData;
+        return (
+          <>
+            Placed PO-{order?.poNumber ?? d.poNumber} to <strong>{d.supplier}</strong> {'—'} {d.lineItems.length} {d.lineItems.length === 1 ? 'line' : 'lines'}
+          </>
+        );
+      }
+      case 'order-receive': {
+        const order = orders.find(o => o.id === tx.itemId);
+        const lineCount = order?.lineItems.filter(l => (l.quantityReceived ?? 0) > 0).length ?? 0;
+        return (
+          <>
+            Received PO-{order?.poNumber ?? 'unknown'} {'—'} {lineCount} {lineCount === 1 ? 'batch' : 'batches'} added
+          </>
+        );
+      }
+      case 'order-cancel': {
+        const order = orders.find(o => o.id === tx.itemId);
+        return <>Cancelled PO-{order?.poNumber ?? 'unknown'}</>;
+      }
       default:
         return <>Unknown action</>;
     }
@@ -181,7 +247,7 @@ function ActivityFeed() {
         ) : (
           <ul className="activity-list">
             {recent.map(tx => {
-              const cfg = typeConfig[tx.type] ?? typeConfig['item-create'];
+              const cfg = ACTIVITY_TYPE_CONFIG[tx.type] ?? ACTIVITY_TYPE_CONFIG['item-create'];
               return (
                 <li key={tx.id} className="activity-item">
                   <div className={`activity-icon activity-icon--${cfg.iconClass}`}>
@@ -217,27 +283,30 @@ interface ExpiringBatchRow {
 
 function ExpiringTable({ items }: { items: InventoryItem[] }) {
   const navigate = useNavigate();
-  // Flatten: one row per expiring batch, not per item
-  const rows: ExpiringBatchRow[] = [];
-  for (const item of items) {
-    for (const batch of item.batches) {
-      if (!batch.expirationDate || batch.quantity <= 0) continue;
-      const days = daysUntil(batch.expirationDate);
-      if (days >= 0 && days <= 30) {
-        rows.push({
-          itemId: item.id,
-          sku: item.sku,
-          name: item.name,
-          location: item.location,
-          lotNumber: batch.lotNumber,
-          batchQty: batch.quantity,
-          expirationDate: batch.expirationDate,
-          days,
-        });
+  // One row per expiring batch — not per item.
+  const rows = useMemo<ExpiringBatchRow[]>(() => {
+    const out: ExpiringBatchRow[] = [];
+    for (const item of items) {
+      for (const batch of item.batches) {
+        if (!batch.expirationDate || batch.quantity <= 0) continue;
+        const days = daysUntil(batch.expirationDate);
+        if (days >= 0 && days <= 30) {
+          out.push({
+            itemId: item.id,
+            sku: item.sku,
+            name: item.name,
+            location: item.location,
+            lotNumber: batch.lotNumber,
+            batchQty: batch.quantity,
+            expirationDate: batch.expirationDate,
+            days,
+          });
+        }
       }
     }
-  }
-  rows.sort((a, b) => a.days - b.days);
+    out.sort((a, b) => a.days - b.days);
+    return out;
+  }, [items]);
 
   if (rows.length === 0) return null;
 
@@ -299,8 +368,55 @@ function ExpiringTable({ items }: { items: InventoryItem[] }) {
   );
 }
 
+function OverdueOrdersPanel({ orders }: { orders: Order[] }) {
+  const navigate = useNavigate();
+  const today = todayISO();
+  const overdue = useMemo(
+    () => orders.filter(o => o.status === 'placed' && o.expectedDeliveryDate && o.expectedDeliveryDate < today),
+    [orders, today],
+  );
+  if (overdue.length === 0) return null;
+
+  return (
+    <div className="panel" style={{ animationDelay: '0.35s' }}>
+      <div className="panel__header">
+        <span className="panel__title">
+          <span className="panel__title-dot" style={{ background: 'var(--critical)' }} />
+          Overdue Orders
+        </span>
+        <span className="panel__count">{overdue.length} orders</span>
+      </div>
+      <div className="panel__body">
+        <table className="data-table">
+          <thead>
+            <tr>
+              <th>PO #</th>
+              <th>Supplier</th>
+              <th>Expected</th>
+              <th>Days Overdue</th>
+            </tr>
+          </thead>
+          <tbody>
+            {overdue.map(o => {
+              const daysOver = Math.floor((Date.parse(today) - Date.parse(o.expectedDeliveryDate || today)) / 86400000);
+              return (
+                <tr key={o.id} onClick={() => navigate(`/orders/${o.id}`)} style={{ cursor: 'pointer' }}>
+                  <td className="cell-sku">{o.poNumber}</td>
+                  <td>{o.supplier}</td>
+                  <td className="cell-mono">{o.expectedDeliveryDate}</td>
+                  <td><span className="badge badge--critical">{daysOver}d</span></td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
 export default function Dashboard() {
-  const { items } = useInventory();
+  const { items, orders } = useInventory();
 
   return (
     <main className="page">
@@ -309,12 +425,14 @@ export default function Dashboard() {
         <span className="page-subtitle">Last synced: just now</span>
       </div>
 
-      <SummaryCards items={items} />
+      <SummaryCards items={items} orders={orders} />
 
       <div className="dashboard-grid">
         <LowStockTable items={items} />
         <ExpiringTable items={items} />
       </div>
+
+      <OverdueOrdersPanel orders={orders} />
 
       <div className="dashboard-grid" style={{ gridTemplateColumns: '1fr' }}>
         <ActivityFeed />

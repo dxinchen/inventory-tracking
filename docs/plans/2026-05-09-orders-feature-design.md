@@ -1,7 +1,66 @@
 # Orders Feature Design
 
 **Date:** 2026-05-09
-**Status:** Design (revised after independent Codex review + adversarial Opus 4.7 review), ready for implementation plan
+**Status:** Implemented and hardened through 5 adversarial-review rounds (Codex). See **Implementation status (hand-off)** below.
+
+## Implementation status (hand-off)
+
+This section is the canonical "what is true on this branch" — read it first; the rest of the document is the original design, kept for context.
+
+### What shipped
+
+- **MSAL unification** (Step 0 of original plan): `src/auth/msalInstance.ts` exposes the singleton; `AuthGate.tsx` uses it; `AuthProvider.tsx` deleted; `addEventCallback` paired with `removeEventCallback` in cleanup. All test mocks updated to `vi.mock('../../auth/msalInstance', ...)`.
+- **Forward-compat schemas** (Step 0a): `TransactionReadSchema` (tolerant `.passthrough()`) for reads, `TransactionWriteSchema` (strict) for writes. `validateItemUpdate` keeps `.strict()`. `TransactionLogSchema.schemaVersion` accepts `z.number().optional()` so future v3 logs round-trip without throwing (R5 fix). Per-entry `safeParse` skips unknown shapes.
+- **Retry/backoff + Zod-on-write** (Step 0b): `MAX_RETRIES = 6`, jittered exponential backoff, `parseTransactionInput` runs strict schema before business validation.
+- **Dashboard refactor** (Step 0c): `tx.data` casts pushed inside per-`case` branches.
+- **`unitOfMeasure` rollout** (Step 1): model + schemas + derive + UI + import/export, with empty-string→undefined submit shim on the update path.
+- **`isStub` rollout** (Step 1a): graduation logic in `applyToInventoryMap` (monotonic `false`), `InventoryList` "Show stubs" toggle, dashboard low-stock filter excludes stubs.
+- **Order transaction model + `appendTransactions`** (Step 2): `order-create` / `order-receive` / `order-cancel`, sequential incremental staged validation via shared `applyToInventoryMap` / `applyToOrdersMap`, frozen-identity (caller pre-rolls UUIDs), `BatchPartiallyCommittedError` / `IdReuseError` / `DuplicateInputIdError` / `DuplicateOrderIdError`. Idempotent retries on 412.
+- **`deriveOrders` + `orderService`** (Step 3): `Order` types, derive function, `findLatestLineItemForItem` (filters non-cancelled), defensive-ignore branches when item/order id-spaces collide.
+- **Orders UI** (Step 4): `/orders`, `/orders/new`, `/orders/:id`, status-flow rendering in activity feed.
+- **Receive flow** (Step 5): `/orders/:id/receive` form, multi-event commit (`order-receive` + N `stock-in` in one batch), past-expiration optional reason, `(via PO-...)` traceability on stock-in rendering.
+- **Attachments** (Step 6): `bootstrap.ts` adds `orders/` folder; `attachmentService.ts` upload/delete/getUrl; staged-upload lifecycle in create + receive forms with name+size dedup, abort fan-out, beforeunload/pagehide cleanup, logout cleanup; detail page renders both `placed` and `received` buckets; `scripts/prune-order-attachments.ts` ships with README.
+- **Polish** (Step 7): "Cancel & Re-create" button + banner; PO#-uniqueness validator; supplier autocomplete; over-receive confirm prompt; past-expiration warning; empty-receive blocked at validator level (R2 fix).
+
+### Hand-off — hardening applied via review-fix loop
+
+5 adversarial-review rounds applied 13 fixes. Highlights:
+
+- **R1**: prune script aborts on parse failures; `cancelAndRecreate` wires attachments through `withAttachmentCleanup`; `MAX_FILE_SIZE` lowered to 4 MB to match Graph simple-PUT cap; upload-session chunking byte-aligned (since reverted in R5 — see below).
+- **R2**: `EmptyReceiveError` blocks all-zero receives at the validator (a UI-only check would let scripted callers close a PO without producing stock); `withAttachmentCleanup` exempts `BatchPartiallyCommittedError` (the persisted log already references the files, so deleting them would orphan refs); `tsx` and `@azure/msal-node` declared in `devDependencies` so `npm run prune:dry` works.
+- **R3**: `Export.tsx` switched from `mockItems`/`mockTransactions` to `useInventory()` and gained an Orders CSV; `ReceiveStockInBindingError` enforces a batch-level invariant (every `order-receive` must be backed by exactly one `stock-in` per positive received line, matching itemId/quantity/lot/expiration; orphan stock-ins with `orderId` are also rejected).
+- **R4**: bootstrap-vs-commit race guarded by `writeCounterRef` — bootstrap discards its read if a commit landed in flight; `ItemPicker` clears parent line's `itemId`/`quickAdd` on text edit so users can't submit a SKU they edited away from.
+- **R5**: provider fails closed when `result.data.transactions.length !== result.known.length` instead of rendering partial state; bootstrap initial PUT uses `If-None-Match: *` so a concurrent session can't be overwritten between the existence check and the create; **upload-session fallback removed** in favor of `LogTooLargeError` because Graph's chunk PUTs carry no eTag guard — sharding is the next step when we approach 4 MB; `schemaVersion` widened to `z.number().optional()` so future v3 logs don't throw at envelope parse.
+
+### Confirmed YAGNI (deliberately not built)
+
+These were either in the original out-of-scope list or surfaced as recommendations in review and explicitly skipped:
+
+- Multi-lot per line at receive time
+- Partial receives across multiple events (single-event receive remains the design — see line 397; short-receive moves PO to `received` per line 578)
+- PO templates / favorites
+- Email notifications
+- PO PDF export
+- Per-folder SharePoint permission splits for attachments
+- An `order-update` transaction type (cancel + re-create stands in)
+- Log sharding (deferred until log approaches 4 MB; `LogTooLargeError` is the loud failure that triggers it)
+
+### Out-of-scope findings carried forward (pre-existing, not fixed)
+
+- **`DEV_ADMINS` fallback in `src/auth/permissions.ts`**: when MSAL is configured but the active token has no `roles` claim, the hardcoded list still grants admin. Pre-existing on `master`; this branch only changed the import path. Tighten by gating on `!msalConfigured || import.meta.env.DEV` if production tightening is needed.
+- **`InventoryList.tsx` lint baseline**: 7 `react-hooks/static-components` errors from `SortHeader` defined inside the component. Pre-existing on `master`; baseline not regressed by this branch.
+
+### How to verify locally
+
+```bash
+npm install
+npx tsc -b              # clean
+npm run test:run        # 87/87 passing
+npm run lint            # 7 pre-existing errors in InventoryList.tsx (unchanged)
+npm run prune:dry       # exits cleanly with "Missing env" — confirms imports resolve
+```
+
+Server-side rollback: SharePoint version history is on by default; `transactions.json` history is the rollback path. There is no client-side snapshot script.
 
 ## Overview
 

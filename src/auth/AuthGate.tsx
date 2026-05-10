@@ -1,8 +1,8 @@
 import { type ReactNode, useEffect, useState } from 'react';
+import { EventType } from '@azure/msal-browser';
 import LoginPage from '../components/LoginPage';
-
-const clientId = import.meta.env.VITE_MSAL_CLIENT_ID;
-const msalConfigured = Boolean(clientId && clientId !== 'not-configured');
+import { msalConfigured, loginScopes } from './msalConfig';
+import { msalInstance } from './msalInstance';
 
 interface AuthGateProps {
   children: (ctx: { userEmail: string; onLogout?: () => void }) => ReactNode;
@@ -38,13 +38,9 @@ function MsalAuthGate({ children }: AuthGateProps) {
 
   useEffect(() => {
     let cancelled = false;
+    let callbackId: string | null = null;
 
     async function init() {
-      // Dynamic import so MSAL is only loaded when configured
-      const { PublicClientApplication, EventType } = await import('@azure/msal-browser');
-      const { msalConfig, loginScopes } = await import('./msalConfig');
-
-      const msalInstance = new PublicClientApplication(msalConfig);
       await msalInstance.initialize();
 
       const response = await msalInstance.handleRedirectPromise();
@@ -57,7 +53,7 @@ function MsalAuthGate({ children }: AuthGateProps) {
         }
       }
 
-      msalInstance.addEventCallback((event) => {
+      callbackId = msalInstance.addEventCallback((event) => {
         if (event.eventType === EventType.LOGIN_SUCCESS && event.payload) {
           const payload = event.payload as { account: Parameters<typeof msalInstance.setActiveAccount>[0] };
           msalInstance.setActiveAccount(payload.account);
@@ -99,7 +95,11 @@ function MsalAuthGate({ children }: AuthGateProps) {
       }
     });
 
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+      // Without removal, StrictMode dev double-mount accumulates callbacks.
+      if (callbackId) msalInstance.removeEventCallback(callbackId);
+    };
   }, []);
 
   if (state.status === 'loading') {

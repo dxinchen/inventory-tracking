@@ -8,7 +8,7 @@ export default function NewItem() {
   const [form, setForm] = useState({
     sku: '', name: '', quantity: '0', location: '', category: '', supplier: '',
     unitCost: '0', reorderPoint: '0', vendor: '', referenceNumber: '',
-    lotNumber: '', expirationDate: '',
+    lotNumber: '', expirationDate: '', unitOfMeasure: 'each',
   });
   const [toast, setToast] = useState('');
 
@@ -16,27 +16,36 @@ export default function NewItem() {
     setForm(prev => ({ ...prev, [field]: value }));
   }
 
-  function handleSubmit(e: React.FormEvent) {
+  const [submitting, setSubmitting] = useState(false);
+
+  async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
-    if (!form.sku || !form.name) return;
+    if (!form.sku || !form.name || submitting) return;
+    setSubmitting(true);
 
-    const item = addItem({
-      sku: form.sku,
-      name: form.name,
-      quantity: parseInt(form.quantity, 10) || 0,
-      location: form.location,
-      category: form.category,
-      supplier: form.supplier,
-      unitCost: parseFloat(form.unitCost) || 0,
-      reorderPoint: parseInt(form.reorderPoint, 10) || 0,
-      vendor: form.vendor,
-      referenceNumber: form.referenceNumber,
-      lotNumber: form.lotNumber || undefined,
-      expirationDate: form.expirationDate || undefined,
-    });
+    try {
+      const item = await addItem({
+        sku: form.sku,
+        name: form.name,
+        quantity: parseInt(form.quantity, 10) || 0,
+        location: form.location,
+        category: form.category,
+        supplier: form.supplier,
+        unitCost: parseFloat(form.unitCost) || 0,
+        reorderPoint: parseInt(form.reorderPoint, 10) || 0,
+        vendor: form.vendor,
+        referenceNumber: form.referenceNumber,
+        unitOfMeasure: form.unitOfMeasure || 'each',
+        lotNumber: form.lotNumber || undefined,
+        expirationDate: form.expirationDate || undefined,
+      });
 
-    setToast(`Created ${item.name}`);
-    setTimeout(() => navigate(`/inventory/${item.id}`), 800);
+      setToast(`Created ${item.name}`);
+      setTimeout(() => navigate(`/inventory/${item.id}`), 800);
+    } catch (err) {
+      setToast(`Error: ${err instanceof Error ? err.message : String(err)}`);
+      setSubmitting(false);
+    }
   }
 
   return (
@@ -106,9 +115,17 @@ export default function NewItem() {
                 <input className="form-input" placeholder="e.g. PO-2026-0050" value={form.referenceNumber} onChange={e => set('referenceNumber', e.target.value)} />
               </div>
               <div className="form-group">
+                <label className="form-label">Unit of Measure</label>
+                <input className="form-input" placeholder="e.g. each, box, kit, case" value={form.unitOfMeasure} onChange={e => set('unitOfMeasure', e.target.value)} />
+              </div>
+            </div>
+
+            <div className="form-row">
+              <div className="form-group">
                 <label className="form-label">Initial Quantity</label>
                 <input className="form-input" type="number" min="0" value={form.quantity} onChange={e => set('quantity', e.target.value)} />
               </div>
+              <div className="form-group" />
             </div>
 
             {parseInt(form.quantity, 10) > 0 && (
@@ -126,7 +143,7 @@ export default function NewItem() {
 
             <div className="btn-group" style={{ justifyContent: 'flex-end', gap: '12px' }}>
               <button type="button" className="btn btn-secondary" onClick={() => navigate('/inventory')}>Cancel</button>
-              <button type="submit" className="btn btn-primary" disabled={!form.sku || !form.name}>Create Item</button>
+              <button type="submit" className="btn btn-primary" disabled={!form.sku || !form.name || submitting}>{submitting ? 'Saving...' : 'Create Item'}</button>
             </div>
           </div>
         </div>

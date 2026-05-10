@@ -1,4 +1,4 @@
-import { msalInstance } from '../auth/AuthProvider';
+import { msalInstance } from '../auth/msalInstance';
 import { graphScopes } from '../auth/msalConfig';
 
 export class GraphError extends Error {

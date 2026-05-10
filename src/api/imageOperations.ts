@@ -1,16 +1,7 @@
 import { v4 as uuidv4 } from 'uuid';
 import { graphFetch } from './graphClient';
 import { getDriveItemUrl, getImageFilePath } from './paths';
-
-/**
- * Sanitize a filename: strip path separators, collapse whitespace, lowercase.
- */
-function sanitizeFilename(name: string): string {
-  return name
-    .replace(/[/\\:*?"<>|]/g, '')
-    .replace(/\s+/g, '-')
-    .toLowerCase();
-}
+import { sanitizeFilename } from './filenames';
 
 /**
  * Upload an image to SharePoint /InventoryApp/images/{uuid}-{sanitized-name}
